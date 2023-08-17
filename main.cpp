@@ -57,6 +57,35 @@ using Vector = std::vector<T>;
 String auth_token       {""};
 String broadcaster_name {""};
 
+int get_video_length(const String& s)
+{
+    const auto song_duration {"dur.txt"};
+
+    String dc {"yt-dlp --print duration " + s + " > " + song_duration};
+
+    system(dc.c_str());
+
+    std::ifstream file {song_duration};
+    int dur;
+    file>>dur;
+
+    return dur;
+}
+
+String get_video_title(const String& s)
+{
+    const auto title {"lst.txt"};
+
+    String dc {"yt-dlp --print title " + s + " > " + title};
+
+    system(dc.c_str());
+
+    std::ifstream file {title};
+    String t;
+    std::getline(file, t);
+    return t;
+}
+
 struct Parsed_Message
 {
     String host;
@@ -346,17 +375,8 @@ struct Websocket_Endpoint
 
 struct Bot;
 
-void check_music_queue(Bot*);
-
 struct Bot
 {
-
-    Bot()
-    {
-        music_thread = std::thread(check_music_queue, this);
-        music_thread.detach();
-    }
-
     using Callback = void(*)(Bot*, const Vector<String>& args);
 
     struct Command
@@ -364,9 +384,6 @@ struct Bot
         String name;
         Callback callback;
     };
-
-
-    Vector<Command> commands;
 
     void add_command(const String& name, Callback c){
         commands.push_back({name, c});
@@ -383,23 +400,94 @@ struct Bot
         return nullptr;
     }
 
-    int connection_id;
-    std::mutex music_thread_mutex;
-    Websocket_Endpoint end_point;
-    std::thread music_thread;
-    Vector<Vector<String>> music_queue;
-};
-
-void check_music_queue(Bot* b)
-{
-    std::lock_guard<std::mutex> g {b->music_thread_mutex};
-    while(!b->music_queue.empty())
+    void check_messages()
     {
-        auto c {b->find_command("sr")};
-        c->callback(b, b->music_queue.front());
-        b->music_queue.erase(b->music_queue.begin());
+        if(!handle->priv_messages.empty())
+        {
+            const auto& sender {handle->priv_messages.front()};
+            auto tokens {tokenize(sender.message)};
+            if(tokens[0][0] == '!')
+            {
+                auto c {find_command(tokens[0].substr(1, String::npos))};
+                if(c)
+                {
+                    tokens.erase(tokens.begin());
+                    tokens.insert(tokens.begin(), sender.nick);
+                    auto t {std::thread(c->callback, this, tokens)};
+                    t.detach();
+                }
+            }
+            handle->priv_messages.erase(handle->priv_messages.begin());
+        }
     }
-}
+
+    void check_music_queue()
+    {
+        std::lock_guard<std::mutex> g {music_mutex};
+        if(!music_queue.empty())
+        {
+            const auto& music {music_queue.front()};
+    
+            if(music.duration > 600){
+                add_message(format_reply(music.args[0], "video too long"));
+            }
+            else
+            {
+    
+                String str {"start /min mpv " + music.args[1] + " --no-video"};
+    
+                auto result {system(str.c_str())};
+                if(result == 0)
+                {
+                    add_message(format_reply_2("Music : " + music.title + " requested ->", music.args[0]));
+                    music_queue.erase(music_queue.begin());
+                    std::this_thread::sleep_for(std::chrono::seconds(music.duration));
+                }
+                else
+                {
+                    music_queue.erase(music_queue.begin());
+                    add_message(format_reply(music.args[0], "something went wrong..."));
+                }
+            }
+        }
+    }
+
+    void send_messages()
+    {
+        std::lock_guard<std::mutex> g {send_mutex};
+        for(const auto& s : messages_to_send){
+            end_point.send(connection_id, s);
+        }
+        messages_to_send.clear();
+    }
+
+    void add_message(const String& str)
+    {
+        std::lock_guard<std::mutex> g {send_mutex};
+        messages_to_send.push_back(str);
+    }
+
+
+    int connection_id;
+    std::mutex music_mutex;
+    std::mutex send_mutex;
+    Connection_Metadata::Pointer handle;
+    Websocket_Endpoint end_point;
+    Timer music_timer;
+    std::thread music_thread;
+
+    Vector<Command> commands;
+
+    struct Music_Info
+    {
+        String title;
+        int duration;
+        Vector<String> args;
+    };
+
+    Vector<String> messages_to_send;
+    Vector<Music_Info> music_queue;
+};
 
 void commands_callback(Bot* b, const Vector<String>& args)
 {
@@ -407,101 +495,80 @@ void commands_callback(Bot* b, const Vector<String>& args)
     for(auto& c : b->commands){
         list += c.name + " "; 
     }
-   b->end_point.send(b->connection_id, format_reply(args[0], list));
+    b->add_message(format_reply(args[0], list));
 }
 
 void stack_callback(Bot* b, const Vector<String>& args)
 {
-   b->end_point.send(b->connection_id, format_reply(args[0], "stack deez nuts in your mouth GOTTEM"));
+   b->add_message(format_reply(args[0], "stack deez nuts in your mouth GOTTEM"));
 }
 
 void drop_callback(Bot* b, const Vector<String>& args)
 {
-   b->end_point.send(b->connection_id, format_reply(args[0], "drop deez nuts in your mouth GOTTEM"));
+   b->add_message(format_reply(args[0], "drop deez nuts in your mouth GOTTEM"));
 }
 
 void discord_callback(Bot* b, const Vector<String>& args)
 {
-   b->end_point.send(b->connection_id, format_reply(args[0], "join my discord https://discord.gg/9xVKDekJtg"));
+   b->add_message(format_reply(args[0], "join my discord https://discord.gg/9xVKDekJtg"));
 }
 
 void game_callback(Bot* b, const Vector<String>& args)
 {
-   b->end_point.send(b->connection_id, format_reply(args[0], "working on a roguelike called Morphus! https://store.steampob->end_pointred.com/app/2371310/Morphus/"));
+   b->add_message(format_reply(args[0], "working on a roguelike called Morphus! https://store.steampowered.com/app/2371310/Morphus/"));
 }
 
 void editor_callback(Bot* b, const Vector<String>& args)
 {
-   b->end_point.send(b->connection_id, format_reply(args[0], "neovim baseg"));
+   b->add_message(format_reply(args[0], "neovim baseg"));
 }
 
 void font_callback(Bot* b, const Vector<String>& args)
 {
-   b->end_point.send(b->connection_id, format_reply(args[0], "https://github.com/nathco/Office-Code-Pro"));
+   b->add_message(format_reply(args[0], "https://github.com/nathco/Office-Code-Pro"));
 }
 
 void keyboard_callback(Bot* b, const Vector<String>& args)
 {
-   b->end_point.send(b->connection_id, format_reply(args[0], "keychron k8 + kailh white switches"));
+   b->add_message(format_reply(args[0], "keychron k8 + kailh white switches"));
+}
+
+void engine_callback(Bot* b, const Vector<String>& args)
+{
+   b->add_message(format_reply(args[0], "c++ and SDL2"));
 }
 
 void vimconfig_callback(Bot* b, const Vector<String>& args)
 {
-   b->end_point.send(b->connection_id, format_reply(args[0], "https://github.com/mrnoob17/my-nvim-init/blob/main/init.lua"));
+   b->add_message(format_reply(args[0], "https://github.com/mrnoob17/my-nvim-init/blob/main/init.lua"));
+}
+
+void friends_callback(Bot* b, const Vector<String>& args)
+{
+   b->add_message(format_reply(args[0], "twitch.tv/azenris twitch.tv/tk_dev twitch.tv/tkap1 twitch.tv/athano twitch.tv/cakez77 twitch.tv/tapir2342"));
 }
 
 void os_callback(Bot* b, const Vector<String>& args)
 {
-   b->end_point.send(b->connection_id, format_reply(args[0], "not linux baseg"));
+   b->add_message(format_reply(args[0], "not linux baseg"));
 }
 
 void music_callback(Bot* b, const Vector<String>& args)
 {
-    const auto song_duration {"dur.txt"};
-
-    String dc {"yt-dlp --print duration " + args[1] + " > " + song_duration};
-
-    system(dc.c_str());
-
-    auto duration {[&]()
+    auto title {get_video_title(args[1])};
+    if(title.empty())
     {
-        std::ifstream file {song_duration};
-        int dur;
-        file>>dur;
-        return dur;
-    }};
-
-    const auto d {duration()};
-
-    if(d > 600)
-    {
-        b->end_point.send(b->connection_id, format_reply(args[0], "music way too long"));
+        b->add_message(format_reply(args[0], "invalid link"));
         return;
     }
-
+    auto duration {get_video_length(args[1])};
+    if(duration > 600)
     {
-        std::lock_guard<std::mutex> g {b->music_thread_mutex};
-        if(!b->music_queue.empty())
-        {
-            b->music_queue.push_back(args);
-            return;
-        }
+        b->add_message(format_reply(args[0], "video too long"));
+        return;
     }
-
-    system("del *.mp3");
-
-    String c {"yt-dlp -x --audio-format mp3 " + args[1]};
-
-    auto result {system(c.c_str())};
-
-    if(result == 1){
-        b->end_point.send(b->connection_id, format_reply(args[0], "bad video link"));
-    }
-    else
-    {
-        b->end_point.send(b->connection_id, format_reply_2("current music requested by", args[0]));
-        system("mpv *.mp3");
-    }
+    std::lock_guard<std::mutex> g {b->music_mutex};
+    b->music_queue.push_back({title, duration, args});
 }
 
 void start_bot(int args, const char** argc)
@@ -527,11 +594,13 @@ void start_bot(int args, const char** argc)
     bot.add_command("discord", discord_callback); 
     bot.add_command("game", game_callback); 
     bot.add_command("editor", editor_callback); 
+    bot.add_command("engine", engine_callback); 
     bot.add_command("font", font_callback); 
     bot.add_command("keyboard", keyboard_callback); 
     bot.add_command("vimconfig", vimconfig_callback); 
     bot.add_command("os", os_callback); 
     bot.add_command("sr", music_callback); 
+    bot.add_command("friends", friends_callback); 
 
     bot.connection_id = bot.end_point.connect("ws://irc-ws.chat.twitch.tv:80");
 
@@ -541,35 +610,53 @@ void start_bot(int args, const char** argc)
     }
     else
     {
-        auto handle {bot.end_point.connection_list[bot.connection_id]};
+        bot.handle = bot.end_point.connection_list[bot.connection_id];
         auto running {true};
         std::atomic<bool> said_welcome_message {false};
+
+        const auto sleep_time {100};
+
+        auto message_thread {std::thread([&](Bot* b)
+        {
+            while(true)
+            {
+                b->check_messages();
+                std::this_thread::sleep_for(std::chrono::milliseconds(sleep_time));
+            }
+        }, &bot)};
+        message_thread.detach();
+
+        auto music_thread {std::thread([&](Bot* b)
+        {
+            while(true)
+            {
+                b->check_music_queue();
+                std::this_thread::sleep_for(std::chrono::milliseconds(sleep_time));
+            }
+        }, &bot)};
+        music_thread.detach();
+
+        auto send_thread {std::thread([&](Bot* b)
+        {
+            while(true)
+            {
+                b->send_messages();
+                std::this_thread::sleep_for(std::chrono::milliseconds(sleep_time));
+            }
+        }, &bot)};
+        send_thread.detach();
+
         while(running)
         {
             if(!said_welcome_message)
             {
-                if(handle->joined)
+                if(bot.handle->joined)
                 {
-                    bot.end_point.send(bot.connection_id, "PRIVMSG #" + broadcaster_name + " :BatChest bot has started\r\n");
+                    bot.add_message("PRIVMSG #" + broadcaster_name + " :BatChest bot has started\r\n");
                     said_welcome_message = true;
                 }
             }
-            if(!handle->priv_messages.empty())
-            {
-                const auto& sender {handle->priv_messages.front()};
-                auto tokens {tokenize(sender.message)};
-                if(tokens[0][0] == '!')
-                {
-                    auto c {bot.find_command(tokens[0].substr(1, String::npos))};
-                    if(c)
-                    {
-                        tokens.erase(tokens.begin());
-                        tokens.insert(tokens.begin(), sender.nick);
-                        c->callback(&bot, tokens);
-                    }
-                }
-                handle->priv_messages.erase(handle->priv_messages.begin());
-            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(sleep_time));
         }
     }
 }
