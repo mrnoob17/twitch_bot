@@ -426,30 +426,43 @@ struct Bot
         std::lock_guard<std::mutex> g {music_mutex};
         if(!music_queue.empty())
         {
-            const auto& music {music_queue.front()};
-    
-            if(music.duration > 600){
-                add_message(format_reply(music.args[0], "video too long"));
-            }
-            else
+            const auto can_play {!music_playing()};
+            if(can_play)
             {
+                const auto& music {music_queue.front()};
     
-                String str {"start /min mpv " + music.args[1] + " --no-video"};
-    
-                auto result {system(str.c_str())};
-                if(result == 0)
-                {
-                    add_message(format_reply_2("Music : " + music.title + " requested ->", music.args[0]));
-                    music_queue.erase(music_queue.begin());
-                    std::this_thread::sleep_for(std::chrono::seconds(music.duration));
+                if(music.duration > 600){
+                    add_message(format_reply(music.args[0], "video too long"));
                 }
                 else
                 {
-                    music_queue.erase(music_queue.begin());
-                    add_message(format_reply(music.args[0], "something went wrong..."));
+                    String str {"start /min mpv " + music.args[1] + " --no-video"};
+    
+                    auto result {system(str.c_str())};
+                    if(result == 0)
+                    {
+                        add_message(format_reply_2("Song : " + music.title + " requested ->", music.args[0]));
+                        last_song = music;
+                        last_music_stamp = Clock::now();
+                        music_queue.erase(music_queue.begin());
+                    }
+                    else
+                    {
+                        music_queue.erase(music_queue.begin());
+                        add_message(format_reply(music.args[0], "something went wrong..."));
+                    }
                 }
             }
         }
+    }
+
+    bool music_playing()
+    {
+        if(last_song.args.empty()){
+            return false;
+        }
+        Duration d {Clock::now() - last_music_stamp};
+        return (d.count() < last_song.duration);
     }
 
     void send_messages()
@@ -467,16 +480,16 @@ struct Bot
         messages_to_send.push_back(str);
     }
 
-
     int connection_id;
     std::mutex music_mutex;
     std::mutex send_mutex;
     Connection_Metadata::Pointer handle;
     Websocket_Endpoint end_point;
-    Timer music_timer;
+    Stamp last_music_stamp;
     std::thread music_thread;
 
     Vector<Command> commands;
+    Vector<String> messages_to_send;
 
     struct Music_Info
     {
@@ -485,7 +498,7 @@ struct Bot
         Vector<String> args;
     };
 
-    Vector<String> messages_to_send;
+    Music_Info last_song;
     Vector<Music_Info> music_queue;
 };
 
@@ -567,8 +580,40 @@ void music_callback(Bot* b, const Vector<String>& args)
         b->add_message(format_reply(args[0], "video too long"));
         return;
     }
+    b->add_message(format_reply(args[0], "FeelsOkayMan song added to the queue"));
     std::lock_guard<std::mutex> g {b->music_mutex};
     b->music_queue.push_back({title, duration, args});
+}
+
+void skip_song_callback(Bot* b, const Vector<String>& args)
+{
+    if(!b->music_playing()){
+        b->add_message(format_reply(args[0], "Aware no music is playing"));
+    }
+    else
+    {
+        if(b->last_song.args[0] == args[0])
+        {
+            system("taskkill /f /t /IM mpv.exe");
+            b->last_song = {};
+        }
+        else{
+            b->add_message(format_reply(args[0], "Clueless can't skip other people's music"));
+        }
+    }
+}
+
+void music_count_callback(Bot* b, const Vector<String>& args)
+{
+    std::lock_guard<std::mutex> g {b->music_mutex};
+    b->add_message(format_reply(args[0], std::to_string(b->music_queue.size()) + " song(s) in the queue"));
+}
+
+void song_callback(Bot* b, const Vector<String>& args)
+{
+    if(b->music_playing()){
+        b->add_message(format_reply(args[0], "Song : " + b->last_song.title));
+    }
 }
 
 void start_bot(int args, const char** argc)
@@ -598,9 +643,12 @@ void start_bot(int args, const char** argc)
     bot.add_command("font", font_callback); 
     bot.add_command("keyboard", keyboard_callback); 
     bot.add_command("vimconfig", vimconfig_callback); 
+    bot.add_command("friends", friends_callback); 
     bot.add_command("os", os_callback); 
     bot.add_command("sr", music_callback); 
-    bot.add_command("friends", friends_callback); 
+    bot.add_command("skip", skip_song_callback); 
+    bot.add_command("sc", music_count_callback); 
+    bot.add_command("song", song_callback); 
 
     bot.connection_id = bot.end_point.connect("ws://irc-ws.chat.twitch.tv:80");
 
@@ -652,7 +700,7 @@ void start_bot(int args, const char** argc)
             {
                 if(bot.handle->joined)
                 {
-                    bot.add_message("PRIVMSG #" + broadcaster_name + " :BatChest bot has started\r\n");
+                    bot.add_message("PRIVMSG #" + broadcaster_name + " :coffee481Happy BatChest coffee481Happy\r\n");
                     said_welcome_message = true;
                 }
             }
@@ -666,10 +714,6 @@ int main(int args, const char** argc)
 
     // TODO
     // tts and tiktok api
-    // need to have music folder for the music requests
-    // skip music
-    // music_queue
-    // music request
     // follow notif
     // sub notif
     // point system
