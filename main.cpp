@@ -241,20 +241,23 @@ struct Connection_Metadata
 
     void on_message(Connection_Handle, Client::message_ptr msg)
     {
+        const auto& pay_load {msg->get_payload()};
         if(msg->get_opcode() == websocketpp::frame::opcode::text)
         {
-            messages.push_back("<< " + msg->get_payload());
+            messages.push_back("<< " + pay_load);
             if(messages.back().find("JOIN") != String::npos){
                 joined = true;
             }
-
-            auto parsed_message {parse_message(messages.back())};
+            auto parsed_message {parse_message(pay_load)};
             if(!parsed_message.message.empty()){
                 priv_messages.push_back(parsed_message);
             }
+            if(pay_load.find("PING") != String::npos){
+                ping_messages.push_back(pay_load);
+            }
         }
         else{
-            messages.push_back("<< " + websocketpp::utility::to_hex(msg->get_payload()));
+            messages.push_back("<< " + websocketpp::utility::to_hex(pay_load));
         }
         printf("%s", messages.back().c_str());
     }
@@ -269,6 +272,7 @@ struct Connection_Metadata
     String server;
     Vector<String> messages;
     Vector<Parsed_Message> priv_messages;
+    Vector<String> ping_messages;
     String why_failed;
     std::atomic<bool> joined {false};
 };
@@ -385,8 +389,14 @@ struct Bot
         Callback callback;
     };
 
-    void add_command(const String& name, Callback c){
-        commands.push_back({name, c});
+    void add_command(const String& name, Callback c)
+    {
+        if(experimental){
+            commands.push_back({"_" + name, c});
+        }
+        else{
+            commands.push_back({name, c});
+        }
     }
 
     Command* find_command(const String& name)
@@ -418,6 +428,14 @@ struct Bot
                 }
             }
             handle->priv_messages.erase(handle->priv_messages.begin());
+        }
+        if(!handle->ping_messages.empty())
+        {
+            auto& pong {handle->ping_messages.front()};
+            pong[1] = 'O';
+            add_message(pong);
+            printf("%s", pong.c_str());
+            handle->ping_messages.erase(handle->ping_messages.begin());
         }
     }
 
@@ -480,6 +498,8 @@ struct Bot
         messages_to_send.push_back(str);
     }
 
+    bool experimental {false};
+
     int connection_id;
     std::mutex music_mutex;
     std::mutex send_mutex;
@@ -528,42 +548,42 @@ void discord_callback(Bot* b, const Vector<String>& args)
 
 void game_callback(Bot* b, const Vector<String>& args)
 {
-   b->add_message(format_reply(args[0], "working on a roguelike called Morphus! https://store.steampowered.com/app/2371310/Morphus/"));
+   b->add_message(format_reply(args[0], "Steam : working on a roguelike called Morphus! https://store.steampowered.com/app/2371310/Morphus/"));
 }
 
 void editor_callback(Bot* b, const Vector<String>& args)
 {
-   b->add_message(format_reply(args[0], "neovim baseg"));
+   b->add_message(format_reply(args[0], "Editor : neovim baseg"));
 }
 
 void font_callback(Bot* b, const Vector<String>& args)
 {
-   b->add_message(format_reply(args[0], "https://github.com/nathco/Office-Code-Pro"));
+   b->add_message(format_reply(args[0], "Font : https://github.com/nathco/Office-Code-Pro"));
 }
 
 void keyboard_callback(Bot* b, const Vector<String>& args)
 {
-   b->add_message(format_reply(args[0], "keychron k8 + kailh white switches"));
+   b->add_message(format_reply(args[0], "Keyboard : keychron k8 + kailh white switches"));
 }
 
 void engine_callback(Bot* b, const Vector<String>& args)
 {
-   b->add_message(format_reply(args[0], "c++ and SDL2"));
+   b->add_message(format_reply(args[0], "Engine : c++ and SDL2"));
 }
 
 void vimconfig_callback(Bot* b, const Vector<String>& args)
 {
-   b->add_message(format_reply(args[0], "https://github.com/mrnoob17/my-nvim-init/blob/main/init.lua"));
+   b->add_message(format_reply(args[0], "Vim Config : https://github.com/mrnoob17/my-nvim-init/blob/main/init.lua"));
 }
 
 void friends_callback(Bot* b, const Vector<String>& args)
 {
-   b->add_message(format_reply(args[0], "twitch.tv/azenris twitch.tv/tk_dev twitch.tv/tkap1 twitch.tv/athano twitch.tv/cakez77 twitch.tv/tapir2342"));
+   b->add_message(format_reply(args[0], "Friends : twitch.tv/azenris twitch.tv/tk_dev twitch.tv/tkap1 twitch.tv/athano twitch.tv/cakez77 twitch.tv/tapir2342"));
 }
 
 void os_callback(Bot* b, const Vector<String>& args)
 {
-   b->add_message(format_reply(args[0], "not linux baseg"));
+   b->add_message(format_reply(args[0], "OS : not linux baseg"));
 }
 
 void music_callback(Bot* b, const Vector<String>& args)
@@ -571,13 +591,13 @@ void music_callback(Bot* b, const Vector<String>& args)
     auto title {get_video_title(args[1])};
     if(title.empty())
     {
-        b->add_message(format_reply(args[0], "invalid link"));
+        b->add_message(format_reply(args[0], "pepeLoser invalid link"));
         return;
     }
     auto duration {get_video_length(args[1])};
     if(duration > 600)
     {
-        b->add_message(format_reply(args[0], "video too long"));
+        b->add_message(format_reply(args[0], "AwkwardMonkey video too long"));
         return;
     }
     b->add_message(format_reply(args[0], "FeelsOkayMan song added to the queue"));
@@ -598,7 +618,7 @@ void skip_song_callback(Bot* b, const Vector<String>& args)
             b->last_song = {};
         }
         else{
-            b->add_message(format_reply(args[0], "Clueless can't skip other people's music"));
+            b->add_message(format_reply(args[0], "Clueless can't skip other people's songs"));
         }
     }
 }
@@ -616,11 +636,16 @@ void song_callback(Bot* b, const Vector<String>& args)
     }
 }
 
+void bot_callback(Bot* b, const Vector<String>& args)
+{
+    b->add_message(format_reply(args[0], "C++ Twitch Bot : https://github.com/mrnoob17/twitch_bot"));
+}
+
 void start_bot(int args, const char** argc)
 {
     if(args < 2)
     {
-        printf("you need to pass in the broadcaster name!");
+        printf("no broadcaster name found");
         return;
     }
 
@@ -632,6 +657,7 @@ void start_bot(int args, const char** argc)
     }
 
     Bot bot;
+    bot.experimental = true;
 
     bot.add_command("commands", commands_callback); 
     bot.add_command("stack", stack_callback); 
@@ -649,6 +675,7 @@ void start_bot(int args, const char** argc)
     bot.add_command("skip", skip_song_callback); 
     bot.add_command("sc", music_count_callback); 
     bot.add_command("song", song_callback); 
+    bot.add_command("bot", bot_callback); 
 
     bot.connection_id = bot.end_point.connect("ws://irc-ws.chat.twitch.tv:80");
 
