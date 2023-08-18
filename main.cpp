@@ -1,6 +1,7 @@
 // c++ twitch bot
 #define ASIO_STANDALONE
 #define ASIO_HAS_THREADS
+#define CURL_STATICLIB
  
 #include "websocketpp/config/asio_no_tls_client.hpp"
 
@@ -9,10 +10,185 @@
 #include <cstdio>
 #include <fstream>
 #include <chrono>
+#include <curl/curl.h>
+
+CURL* curl_handle {nullptr};
+
+using Client = websocketpp::client<websocketpp::config::asio_client>;
+using Connection_Handle = websocketpp::connection_hdl;
+using Connection_Pointer = Client::connection_ptr;
+
+using String = std::string;
+
+template<typename T>
+using Vector = std::vector<T>;
 
 using Clock = std::chrono::high_resolution_clock;
 using Stamp = decltype(Clock::now());
 using Duration = std::chrono::duration<float>;
+
+struct CUrl_Result
+{
+    size_t size    {0};
+    char* response {nullptr};
+};
+
+struct Youtube_Video_Info
+{
+    String title    {};
+    String iso_8601_duration;
+    int like_count  {-1};
+    int view_count  {-1};
+    size_t duration {0};
+};
+
+static size_t curl_callback(void *data, size_t size, size_t nmemb, void *clientp)
+{
+    auto real_size {size * nmemb};
+    auto mem {(CUrl_Result*)clientp};
+    
+    auto ptr {(char*)realloc(mem->response, mem->size + real_size + 1)};
+    if(ptr == NULL){
+      return 0;
+    }
+    
+    mem->response = ptr;
+    memcpy(&(mem->response[mem->size]), data, real_size);
+    mem->size += real_size;
+    mem->response[mem->size] = 0;
+    
+    return real_size;
+}
+ 
+String curl_call(const String& s)
+{
+    CUrl_Result chunk {0};
+    CURLcode res;
+    if(curl_handle)
+    {
+        auto deez {curl_easy_setopt(curl_handle, CURLOPT_URL, s.c_str())};
+
+        deez = curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, curl_callback);
+     
+        deez = curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *)&chunk);
+     
+        res = curl_easy_perform(curl_handle);
+    }
+    String str {chunk.response}; 
+    free(chunk.response);
+    return str;
+}
+
+Youtube_Video_Info parse_youtube_api_result(const String& s)
+{
+    String line;
+    std::stringstream ss {s};
+
+    auto string_to_int{[](const String& s)
+    {
+        std::stringstream ss {s};
+        int res;
+        ss>>res;
+        return res;
+    }};
+
+    auto get_content {[](const String& l)
+    {
+        auto colon {l.find(':')};
+        auto first_comma {l.find('"', colon + 1)};
+        auto second_comma {l.find('"', first_comma + 1)};
+        return l.substr(first_comma + 1, (second_comma - first_comma) - 1);
+    }};
+
+    auto convert_iso_8601_to_seconds {[string_to_int](const String& s)
+    {
+        auto get_number_component {[&s, string_to_int](size_t ctr)
+        {
+            String value;
+            
+            while(isdigit(s[ctr]))
+            {
+                value = s[ctr] + value;
+                ctr--;
+            }
+            return string_to_int(value);
+        }};
+
+        int day_value     {0};
+        int hours_value   {0};
+        int minutes_value {0};
+        int seconds_value {0};
+
+        auto key {s.find("DT")};
+        if(key != s.npos){
+            day_value = get_number_component(key - 1);
+        }
+        key = s.find('H');
+        if(key != s.npos){
+            hours_value = get_number_component(key - 1);
+        }
+        key = s.find('M');
+        if(key != s.npos){
+            minutes_value = get_number_component(key - 1);
+        }
+        key = s.find('S');
+        if(key != s.npos){
+            seconds_value = get_number_component(key - 1);
+        }
+        return (day_value * 24 * 60 * 60) + (hours_value * 60 * 60) + (minutes_value * 60) + seconds_value;
+    }};
+
+    Youtube_Video_Info result;
+
+    auto entered_snippet         {false};
+    auto entered_content_details {false};
+    auto entered_statistics      {false};
+
+    while(std::getline(ss, line))
+    {
+        if(line.find("snippet") != String::npos){
+            entered_snippet = true;
+        }
+        else if(line.find("contentDetails") != String::npos)
+        {
+            entered_content_details = true;
+            entered_snippet = false;
+        }
+        else if(line.find("statistics") != String::npos)
+        {
+            entered_content_details = false;
+            entered_snippet = false;
+            entered_statistics = true;
+        }
+        if(entered_snippet)
+        {
+            if(line.find("title") != String::npos){
+                result.title = get_content(line);
+            }
+        }
+        else if(entered_content_details)
+        {
+            if(line.find("duration") != String::npos)
+            {
+                auto d {get_content(line)};
+                result.iso_8601_duration = d;
+                result.duration = convert_iso_8601_to_seconds(d);
+            }
+        }
+        else if(entered_statistics)
+        {
+            if(line.find("viewCount") != String::npos){
+                result.view_count = string_to_int(get_content(line));
+            }
+            else if(line.find("likeCount") != String::npos)
+            {
+                result.like_count = string_to_int(get_content(line));
+            }
+        }
+    }
+    return result;
+};
+
 
 struct Timer
 {
@@ -45,46 +221,9 @@ struct Timer
     }
 };
 
-using Client = websocketpp::client<websocketpp::config::asio_client>;
-using Connection_Handle = websocketpp::connection_hdl;
-using Connection_Pointer = Client::connection_ptr;
-
-using String = std::string;
-
-template<typename T>
-using Vector = std::vector<T>;
-
-String auth_token       {""};
-String broadcaster_name {""};
-
-int get_video_length(const String& s)
-{
-    const auto song_duration {"dur.txt"};
-
-    String dc {"yt-dlp --print duration " + s + " > " + song_duration};
-
-    system(dc.c_str());
-
-    std::ifstream file {song_duration};
-    int dur;
-    file>>dur;
-
-    return dur;
-}
-
-String get_video_title(const String& s)
-{
-    const auto title {"lst.txt"};
-
-    String dc {"yt-dlp --print title " + s + " > " + title};
-
-    system(dc.c_str());
-
-    std::ifstream file {title};
-    String t;
-    std::getline(file, t);
-    return t;
-}
+String auth_token       {};
+String youtube_api_key  {};
+String broadcaster_name {};
 
 struct Parsed_Message
 {
@@ -449,26 +588,20 @@ struct Bot
             {
                 const auto& music {music_queue.front()};
     
-                if(music.duration > 600){
-                    add_message(format_reply(music.args[0], "video too long"));
+                String str {"start /min mpv " + music.args[1] + " --no-video"};
+    
+                auto result {system(str.c_str())};
+                if(result == 0)
+                {
+                    add_message(format_reply_2("Song : " + music.video.title + " requested ->", music.args[0]));
+                    last_song = music;
+                    last_music_stamp = Clock::now();
+                    music_queue.erase(music_queue.begin());
                 }
                 else
                 {
-                    String str {"start /min mpv " + music.args[1] + " --no-video"};
-    
-                    auto result {system(str.c_str())};
-                    if(result == 0)
-                    {
-                        add_message(format_reply_2("Song : " + music.title + " requested ->", music.args[0]));
-                        last_song = music;
-                        last_music_stamp = Clock::now();
-                        music_queue.erase(music_queue.begin());
-                    }
-                    else
-                    {
-                        music_queue.erase(music_queue.begin());
-                        add_message(format_reply(music.args[0], "something went wrong..."));
-                    }
+                    music_queue.erase(music_queue.begin());
+                    add_message(format_reply(music.args[0], "something went wrong..."));
                 }
             }
         }
@@ -480,7 +613,7 @@ struct Bot
             return false;
         }
         Duration d {Clock::now() - last_music_stamp};
-        return (d.count() < last_song.duration);
+        return (d.count() < last_song.video.duration);
     }
 
     void send_messages()
@@ -513,8 +646,7 @@ struct Bot
 
     struct Music_Info
     {
-        String title;
-        int duration;
+        Youtube_Video_Info video;
         Vector<String> args;
     };
 
@@ -588,21 +720,48 @@ void os_callback(Bot* b, const Vector<String>& args)
 
 void music_callback(Bot* b, const Vector<String>& args)
 {
-    auto title {get_video_title(args[1])};
-    if(title.empty())
-    {
-        b->add_message(format_reply(args[0], "pepeLoser invalid link"));
+
+    auto equals {args[1].find('=')};
+    if(equals == String::npos){
+        b->add_message(format_reply(args[0], "AwkwardMonkey invalid video"));
         return;
     }
-    auto duration {get_video_length(args[1])};
-    if(duration > 600)
+
+    auto video       {args[1].substr(equals + 1, String::npos)}; 
+    String video_arg {"&id=" + video};
+    String key_arg   {"&key=" + youtube_api_key};
+    String api       {"https://www.googleapis.com/youtube/v3/videos?"};
+    String part      {"part=snippet,contentDetails,statistics"};
+
+    auto curl_result {curl_call(api + part + video_arg + key_arg)};
+
+    auto yt_video {parse_youtube_api_result(curl_result)};
+
+    if(yt_video.duration > 600)
     {
         b->add_message(format_reply(args[0], "AwkwardMonkey video too long"));
         return;
     }
+    else if(yt_video.title.empty())
+    {
+        b->add_message(format_reply(args[0], "AwkwardMonkey invalid video"));
+        return;
+    }
+    else if(yt_video.like_count < 1000)
+    {
+        b->add_message(format_reply(args[0], "Susge video kinda sus"));
+        return;
+    }
+    else if(yt_video.view_count < 1000)
+    {
+        b->add_message(format_reply(args[0], "Susge video kinda sus"));
+        return;
+    }
+
     b->add_message(format_reply(args[0], "FeelsOkayMan song added to the queue"));
     std::lock_guard<std::mutex> g {b->music_mutex};
-    b->music_queue.push_back({title, duration, args});
+
+    b->music_queue.push_back({yt_video, args});
 }
 
 void skip_song_callback(Bot* b, const Vector<String>& args)
@@ -632,7 +791,7 @@ void music_count_callback(Bot* b, const Vector<String>& args)
 void song_callback(Bot* b, const Vector<String>& args)
 {
     if(b->music_playing()){
-        b->add_message(format_reply(args[0], "Song : " + b->last_song.title));
+        b->add_message(format_reply(args[0], "Song : " + b->last_song.video.title));
     }
 }
 
@@ -649,11 +808,14 @@ void start_bot(int args, const char** argc)
         return;
     }
 
+    curl_handle = curl_easy_init();
+
     broadcaster_name = argc[1];
 
     {
         std::ifstream file {"token.nut"};
         file>>auth_token;
+        file>>youtube_api_key;
     }
 
     Bot bot;
@@ -734,12 +896,15 @@ void start_bot(int args, const char** argc)
             std::this_thread::sleep_for(std::chrono::milliseconds(sleep_time));
         }
     }
+    curl_easy_cleanup(curl_handle);
 }
 
 int main(int args, const char** argc)
 {
 
     // TODO
+    // use curl with youtube api
+    // curl "https://www.googleapis.com/youtube/v3/videos?part=snippet&id=<VIDEO ID>&key=<API-KEY>"
     // tts and tiktok api
     // follow notif
     // sub notif
