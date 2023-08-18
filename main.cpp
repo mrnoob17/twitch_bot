@@ -903,13 +903,12 @@ int main(int args, const char** argc)
 {
 
     // TODO
-    // use curl with youtube api
-    // curl "https://www.googleapis.com/youtube/v3/videos?part=snippet&id=<VIDEO ID>&key=<API-KEY>"
     // tts and tiktok api
+    // batchest counter
+    // today command
     // follow notif
     // sub notif
     // point system
-    // collect data and sell it
     // raid notif
 
     start_bot(args, argc);
