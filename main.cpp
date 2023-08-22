@@ -53,6 +53,11 @@ String format_reply_2(const String& message, const String& sender)
     return "PRIVMSG #" + BROADCASTER_NAME + " :" + message + " " + "@" + sender + "\r\n";
 }
 
+String format_send(const String& message)
+{
+    return "PRIVMSG #" + BROADCASTER_NAME + " :" + message + "\r\n";
+}
+
 Parsed_Message parse_message(const String& msg)
 {
     if(msg.find("PRIVMSG") == msg.npos){
@@ -487,10 +492,6 @@ struct Bot
     {
         std::lock_guard<std::mutex> guard {curl_mutex};
         curl_easy_reset(curl_handle);
-        auto wrap_in_quotes {[](const String& s)
-        {
-            return '"' + (s) + '"';
-        }};
 
         String url {"https://api.twitch.tv/helix/moderation/bans?broadcaster_id=" + BROADCASTER_ID + "&moderator_id=" + BROADCASTER_ID}; 
 
@@ -751,6 +752,35 @@ void set_today_callback(Bot* b, const Vector<String>& args)
     }
 }
 
+void set_title_callback(Bot* b, const Vector<String>& args)
+{
+    std::lock_guard<std::mutex> guard {b->curl_mutex};
+    curl_easy_reset(curl_handle);
+
+    String url {"https://api.twitch.tv/helix/channels?broadcaster_id=" + BROADCASTER_ID}; 
+
+    curl_easy_setopt(curl_handle, CURLOPT_URL, url.c_str());
+
+    auto list {set_curl_headers(("Authorization: Bearer " + AUTH_TOKEN).c_str(),
+                                ("Client-Id: " + CLIENT_ID).c_str(),
+                                 "Content-Type: application/json")};
+
+    curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, list);
+
+    String post_fields;
+    String title;
+
+    for(int i = 1; i < args.size(); i++){
+        title += args[i] + ' ';
+    }
+    post_fields  = "{" + wrap_in_quotes("title") + ":" + wrap_in_quotes(title) + "}";
+    curl_easy_setopt(curl_handle, CURLOPT_CUSTOMREQUEST, "PATCH");
+    curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, post_fields.c_str());
+    curl_easy_perform(curl_handle);
+    curl_slist_free_all(list);
+    b->add_message(format_send("Stream Title : " + title));
+}
+
 void founder_callback(Bot* b, const Vector<String>& args)
 {
     b->add_message(format_reply(args[0], "You're a founder... founder of deez nuts! GOTTEM"));
@@ -822,6 +852,7 @@ void start_bot(int args, const char** argc)
     bot.add_command("batchest", batchest_callback); 
     bot.add_command("today", today_callback); 
     bot.add_command("settoday", set_today_callback, {moderator_badge, broadcaster_badge}); 
+    bot.add_command("settitle", set_title_callback, {broadcaster_badge, moderator_badge}); 
     bot.add_command("founder", founder_callback, {founder_badge}); 
     bot.add_command("mod", mod_callback, {moderator_badge}); 
     bot.add_command("sub", sub_callback, {subscriber_badge}); 
