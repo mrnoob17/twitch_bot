@@ -9,8 +9,12 @@
 
 #include <cstdio>
 #include <fstream>
-#include <chrono>
-#include <curl/curl.h>
+
+#include "curl_wrapper.hpp"
+#include "types.hpp"
+#include "utilities.hpp"
+#include "youtube_api.hpp"
+#include "json.hpp"
 
 CURL* curl_handle {nullptr};
 
@@ -18,286 +22,35 @@ using Client = websocketpp::client<websocketpp::config::asio_client>;
 using Connection_Handle = websocketpp::connection_hdl;
 using Connection_Pointer = Client::connection_ptr;
 
-using String = std::string;
+const String broadcaster_badge {"broadcaster"};
+const String moderator_badge   {"moderator"};
+const String vip_badge         {"vip"};
+const String founder_badge     {"founder"};
+const String subscriber_badge  {"subscriber"};
 
-template<typename T>
-using Vector = std::vector<T>;
-
-using Clock = std::chrono::high_resolution_clock;
-using Stamp = decltype(Clock::now());
-using Duration = std::chrono::duration<float>;
-
-struct CUrl_Result
-{
-    size_t size    {0};
-    char* response {nullptr};
-};
-
-struct Youtube_Video_Info
-{
-    String title    {};
-    String iso_8601_duration;
-    int like_count  {-1};
-    int view_count  {-1};
-    size_t duration {0};
-};
-
-static size_t curl_callback(void *data, size_t size, size_t nmemb, void *clientp)
-{
-    auto real_size {size * nmemb};
-    auto mem {(CUrl_Result*)clientp};
-    
-    auto ptr {(char*)realloc(mem->response, mem->size + real_size + 1)};
-    if(ptr == NULL){
-      return 0;
-    }
-    
-    mem->response = ptr;
-    memcpy(&(mem->response[mem->size]), data, real_size);
-    mem->size += real_size;
-    mem->response[mem->size] = 0;
-    
-    return real_size;
-}
- 
-String curl_call(const String& s)
-{
-    CUrl_Result chunk {0};
-    CURLcode res;
-    if(curl_handle)
-    {
-        auto deez {curl_easy_setopt(curl_handle, CURLOPT_URL, s.c_str())};
-
-        deez = curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, curl_callback);
-     
-        deez = curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *)&chunk);
-     
-        res = curl_easy_perform(curl_handle);
-    }
-    String str {chunk.response}; 
-    free(chunk.response);
-    return str;
-}
-
-Youtube_Video_Info parse_youtube_api_result(const String& s)
-{
-    String line;
-    std::stringstream ss {s};
-
-    auto string_to_int{[](const String& s)
-    {
-        std::stringstream ss {s};
-        int res;
-        ss>>res;
-        return res;
-    }};
-
-    auto get_content {[](const String& l)
-    {
-        auto colon {l.find(':')};
-        auto first_comma {l.find('"', colon + 1)};
-        auto second_comma {l.find('"', first_comma + 1)};
-        return l.substr(first_comma + 1, (second_comma - first_comma) - 1);
-    }};
-
-    auto convert_iso_8601_to_seconds {[string_to_int](const String& s)
-    {
-        auto get_number_component {[&s, string_to_int](size_t ctr)
-        {
-            String value;
-            
-            while(isdigit(s[ctr]))
-            {
-                value = s[ctr] + value;
-                ctr--;
-            }
-            return string_to_int(value);
-        }};
-
-        int day_value     {0};
-        int hours_value   {0};
-        int minutes_value {0};
-        int seconds_value {0};
-
-        auto key {s.find("DT")};
-        if(key != s.npos){
-            day_value = get_number_component(key - 1);
-        }
-        key = s.find('H');
-        if(key != s.npos){
-            hours_value = get_number_component(key - 1);
-        }
-        key = s.find('M');
-        if(key != s.npos){
-            minutes_value = get_number_component(key - 1);
-        }
-        key = s.find('S');
-        if(key != s.npos){
-            seconds_value = get_number_component(key - 1);
-        }
-        return (day_value * 24 * 60 * 60) + (hours_value * 60 * 60) + (minutes_value * 60) + seconds_value;
-    }};
-
-    Youtube_Video_Info result;
-
-    auto entered_snippet         {false};
-    auto entered_content_details {false};
-    auto entered_statistics      {false};
-
-    while(std::getline(ss, line))
-    {
-        if(line.find("snippet") != String::npos){
-            entered_snippet = true;
-        }
-        else if(line.find("contentDetails") != String::npos)
-        {
-            entered_content_details = true;
-            entered_snippet = false;
-        }
-        else if(line.find("statistics") != String::npos)
-        {
-            entered_content_details = false;
-            entered_snippet = false;
-            entered_statistics = true;
-        }
-        if(entered_snippet)
-        {
-            if(line.find("title") != String::npos){
-                result.title = get_content(line);
-            }
-        }
-        else if(entered_content_details)
-        {
-            if(line.find("duration") != String::npos)
-            {
-                auto d {get_content(line)};
-                result.iso_8601_duration = d;
-                result.duration = convert_iso_8601_to_seconds(d);
-            }
-        }
-        else if(entered_statistics)
-        {
-            if(line.find("viewCount") != String::npos){
-                result.view_count = string_to_int(get_content(line));
-            }
-            else if(line.find("likeCount") != String::npos)
-            {
-                result.like_count = string_to_int(get_content(line));
-            }
-        }
-    }
-    return result;
-};
-
-
-struct Timer
-{
-    Stamp begin;
-    float wait {0};
-    bool started {false};
-    void start(const float dur)
-    {
-        wait = dur;
-        started = true;
-        begin = Clock::now();
-    }
-
-    void stop()
-    {
-        started = false;
-    }
-
-    bool is_time()
-    {
-        if(!started){
-            return false;
-        }
-        auto end {Clock::now()};
-        Duration elapsed {end - begin};
-        if(elapsed.count() >= wait){
-            return true;
-        }
-        return false;
-    }
-};
-
-String auth_token       {};
-String youtube_api_key  {};
-String broadcaster_name {};
+String CLIENT_ID        {};
+String BROADCASTER_ID   {};
+String AUTH_TOKEN       {};
+String YOUTUBE_API_KEY  {};
+String BROADCASTER_NAME {};
 
 struct Parsed_Message
 {
     String host;
     String nick;
     String message;
+    String user_id;
+    String badges;
 };
-
-void clean_line(String* str)
-{
-    if(str->empty()){
-        return;
-    }
-    auto cleanable {[](const char c)
-    {
-        return c == ' ' || c == '\t' || c == '\r' || c == '\n'; 
-    }};
-
-    while(cleanable(str->front()))
-    {
-        str->erase(0, 1); 
-        if(str->empty()){
-            return;
-        }
-    }
-
-    while(cleanable(str->back()))
-    {
-        str->pop_back();
-        if(str->empty()){
-            return;
-        }
-    }
-}
-
-Vector<String> tokenize(const String& str)
-{
-    if(str.empty()){
-        return {};
-    }
-    Vector<String> result;
-    int off {0};
-    auto find {str.find(" ")};
-    if(find == str.npos){
-        result.push_back(str);
-    }
-    else
-    {
-        while(find != str.npos)
-        {
-            result.push_back(str.substr(off, find - off));
-            off = find + 1;
-            find = str.find(" ", off);
-        }
-        if(off < str.length()){
-            result.push_back(str.substr(off, str.npos));
-        }
-    }
-    for(auto& s : result){
-        clean_line(&s);
-    }
-    return result;
-
-}
 
 String format_reply(const String& sender, const String& message)
 {
-    return "PRIVMSG #" + broadcaster_name + " :@" + sender + " " + message + "\r\n";
+    return "PRIVMSG #" + BROADCASTER_NAME + " :@" + sender + " " + message + "\r\n";
 }
-
 
 String format_reply_2(const String& message, const String& sender)
 {
-    return "PRIVMSG #" + broadcaster_name + " :" + message + " " + "@" + sender + "\r\n";
+    return "PRIVMSG #" + BROADCASTER_NAME + " :" + message + " " + "@" + sender + "\r\n";
 }
 
 Parsed_Message parse_message(const String& msg)
@@ -325,15 +78,53 @@ Parsed_Message parse_message(const String& msg)
         return msg.substr(colon + 2, msg.npos);
     }};
 
+    auto get_badges {[&]()
+    {
+        const auto badge_badge {"badges="};
+        auto b_pos {msg.find(badge_badge)}; 
+        const auto bl {strlen(badge_badge)};
+        Vector<String> badges {moderator_badge, broadcaster_badge, vip_badge, founder_badge, subscriber_badge};
+        String result;
+        if(b_pos != String::npos)
+        {
+            const auto semi_colon {msg.find(';', b_pos + bl + 1)};
+            auto start {b_pos + bl};
+            auto badge {msg.find("/", start)};
+            while(badge != String::npos)
+            {
+                result += msg.substr(start, badge - start);
+                result += " ";
+                start = badge + 2;
+                if(start >= semi_colon){
+                    break;
+                }
+                badge = msg.find("/", start);
+            }
+        }
+        return result;
+    }};
+
+    auto get_user_id {[&]()
+    {
+        const auto user_id {"user-id="};
+        auto pos {msg.find(user_id)};
+        pos += 8;
+        return msg.substr(pos, msg.find(';', pos) - pos);
+    }};
+
     Parsed_Message result;
 
     result.host = get_host();
     result.nick = get_nick();
     result.message = get_message();
+    result.badges = get_badges();
+    result.user_id = get_user_id();
 
     clean_line(&result.host);
     clean_line(&result.nick);
     clean_line(&result.message);
+    clean_line(&result.badges);
+    clean_line(&result.user_id);
 
     return result;
 }
@@ -354,9 +145,9 @@ struct Connection_Metadata
         server = cptr->get_response_header("Server");
 
         c->send(handle, "CAP REQ :twitch.tv/membership twitch.tv/tags twitch.tv/commands\r\n", websocketpp::frame::opcode::text);
-        c->send(handle, "PASS oauth:" + auth_token + "\r\n", websocketpp::frame::opcode::text);
-        c->send(handle, "NICK " + broadcaster_name + "\r\n", websocketpp::frame::opcode::text);
-        c->send(handle, "JOIN #" + broadcaster_name + "\r\n", websocketpp::frame::opcode::text);
+        c->send(handle, "PASS oauth:" + AUTH_TOKEN + "\r\n", websocketpp::frame::opcode::text);
+        c->send(handle, "NICK " + BROADCASTER_NAME + "\r\n", websocketpp::frame::opcode::text);
+        c->send(handle, "JOIN #" + BROADCASTER_NAME + "\r\n", websocketpp::frame::opcode::text);
     }
     
     void on_fail(Client* c, Connection_Handle handle)
@@ -391,8 +182,15 @@ struct Connection_Metadata
             if(!parsed_message.message.empty()){
                 priv_messages.push_back(parsed_message);
             }
-            if(pay_load.find("PING") != String::npos){
-                ping_messages.push_back(pay_load);
+            else
+            {
+                auto tokens {tokenize(pay_load)};
+                if(!tokens.empty())
+                {
+                    if(tokens[0] == "PING"){
+                        ping_messages.push_back(pay_load);
+                    }
+                }
             }
         }
         else{
@@ -514,8 +312,6 @@ struct Websocket_Endpoint
     websocketpp::lib::shared_ptr<websocketpp::lib::thread> thread;
 };
 
-
-
 struct Bot;
 
 struct Bot
@@ -526,15 +322,17 @@ struct Bot
     {
         String name;
         Callback callback;
+        Vector<String> badges;
+        bool no_badges;
     };
 
-    void add_command(const String& name, Callback c)
+    void add_command(const String& name, Callback c, const Vector<String>& badges = {}, const bool no_badges = false)
     {
         if(experimental){
-            commands.push_back({"_" + name, c});
+            commands.push_back({"_" + name, c, badges, no_badges});
         }
         else{
-            commands.push_back({name, c});
+            commands.push_back({name, c, badges, no_badges});
         }
     }
 
@@ -555,15 +353,69 @@ struct Bot
         {
             const auto& sender {handle->priv_messages.front()};
             auto tokens {tokenize(sender.message)};
+            auto has_command {false};
             if(tokens[0][0] == '!')
             {
                 auto c {find_command(tokens[0].substr(1, String::npos))};
                 if(c)
                 {
-                    tokens.erase(tokens.begin());
-                    tokens.insert(tokens.begin(), sender.nick);
-                    auto t {std::thread(c->callback, this, tokens)};
-                    t.detach();
+                    has_command = true;
+                    bool badge_is_good {};
+                    if(c->no_badges){
+                        badge_is_good = sender.badges.empty(); 
+                    }
+                    else
+                    {
+                        badge_is_good = c->badges.empty();
+                        for(const auto& s : c->badges)
+                        {
+                            if(sender.badges.find(s) != String::npos)
+                            {
+                                badge_is_good = true;
+                                break;
+                            }
+                        }
+                    }
+                    if(badge_is_good)
+                    {
+                        tokens.erase(tokens.begin());
+                        tokens.insert(tokens.begin(), sender.nick);
+                        auto t {std::thread(c->callback, this, tokens)};
+                        t.detach();
+                    }
+                    else{
+                        add_message(format_reply(sender.nick, "You are not BatChest enough!"));
+                    }
+                }
+            }
+            if(!has_command)
+            {
+                String str;
+                for(const auto& s : tokens)
+                {
+                    if(s == "BatChest"){
+                        batchest_count++;
+                    }
+                    str += s;
+                    str += ' ';
+                }
+                string_decapitalize(&str);
+                int duration {0};
+                auto has_banned_word {false};
+                for(const auto& p : banned_words)
+                {
+                    auto start {0};
+                    auto pos {str.find(p.first)};
+                    while(pos != String::npos)
+                    {
+                        start = pos + 1;
+                        duration += p.second;
+                        has_banned_word = true;
+                        pos = str.find(p.first, start);
+                    }
+                }
+                if(has_banned_word){
+                    ban_user(sender.user_id, duration);
                 }
             }
             handle->priv_messages.erase(handle->priv_messages.begin());
@@ -631,11 +483,81 @@ struct Bot
         messages_to_send.push_back(str);
     }
 
+    void ban_user(const String& id, const int dur)
+    {
+        std::lock_guard<std::mutex> guard {curl_mutex};
+        curl_easy_reset(curl_handle);
+        auto wrap_in_quotes {[](const String& s)
+        {
+            return '"' + (s) + '"';
+        }};
+
+        String url {"https://api.twitch.tv/helix/moderation/bans?broadcaster_id=" + BROADCASTER_ID + "&moderator_id=" + BROADCASTER_ID}; 
+
+        curl_easy_setopt(curl_handle, CURLOPT_URL, url.c_str());
+
+        String user_id {wrap_in_quotes("user_id") + ":" + wrap_in_quotes(id)};
+
+
+        String duration {dur == -1 ? "" : wrap_in_quotes("duration") + ":" + wrap_in_quotes(std::to_string(dur))};
+
+
+        auto list {set_curl_headers(("Authorization: Bearer " + AUTH_TOKEN).c_str(),
+                                    ("Client-Id: " + CLIENT_ID).c_str(),
+                                    "Content-Type: application/json")};
+
+        curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, list);
+
+        String post_fields;
+        if(!duration.empty()){
+            post_fields  = "{\"data\": {" + user_id + "," + duration + "}}";
+        }
+        else{
+            post_fields  = "{\"data\": {" + user_id + "}}";
+        }
+        curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, post_fields.c_str());
+
+        curl_easy_perform(curl_handle);
+        curl_slist_free_all(list);
+    }
+
+    void serialize_in()
+    {
+        String line;
+        String tag;
+        String value;
+        std::ifstream file {data_file_name};
+        while(std::getline(file, line))
+        {
+            clean_line(&line);
+            if(!line.empty())
+            {
+                extract_tag_and_value_from_line(line, &tag, &value);
+                if(tag == "batchest_count"){
+                    std::stringstream ss {value};
+                    ss>>batchest_count;
+                }
+            }
+        }
+    }
+
+    void serialize_out()
+    {
+        std::ofstream file {data_file_name};
+        file<<"batchest_count : "<<batchest_count;
+    }
+
+    ~Bot()
+    {
+        serialize_out();
+    }
+
     bool experimental {false};
 
     int connection_id;
     std::mutex music_mutex;
     std::mutex send_mutex;
+    std::mutex curl_mutex;
     Connection_Metadata::Pointer handle;
     Websocket_Endpoint end_point;
     Stamp last_music_stamp;
@@ -643,6 +565,9 @@ struct Bot
 
     Vector<Command> commands;
     Vector<String> messages_to_send;
+
+    u64 batchest_count {0};
+    String today;
 
     struct Music_Info
     {
@@ -652,6 +577,9 @@ struct Bot
 
     Music_Info last_song;
     Vector<Music_Info> music_queue;
+    Vector<Pair<String, int>> banned_words;
+
+    String data_file_name {"bot.txt"};
 };
 
 void commands_callback(Bot* b, const Vector<String>& args)
@@ -721,6 +649,7 @@ void os_callback(Bot* b, const Vector<String>& args)
 void music_callback(Bot* b, const Vector<String>& args)
 {
 
+    std::lock_guard<std::mutex> guard {b->curl_mutex};
     auto equals {args[1].find('=')};
     if(equals == String::npos){
         b->add_message(format_reply(args[0], "AwkwardMonkey invalid video"));
@@ -729,11 +658,13 @@ void music_callback(Bot* b, const Vector<String>& args)
 
     auto video       {args[1].substr(equals + 1, String::npos)}; 
     String video_arg {"&id=" + video};
-    String key_arg   {"&key=" + youtube_api_key};
+    String key_arg   {"&key=" + YOUTUBE_API_KEY};
     String api       {"https://www.googleapis.com/youtube/v3/videos?"};
     String part      {"part=snippet,contentDetails,statistics"};
 
-    auto curl_result {curl_call(api + part + video_arg + key_arg)};
+    curl_easy_reset(curl_handle);
+
+    auto curl_result {curl_call(api + part + video_arg + key_arg, curl_handle)};
 
     auto yt_video {parse_youtube_api_result(curl_result)};
 
@@ -800,6 +731,46 @@ void bot_callback(Bot* b, const Vector<String>& args)
     b->add_message(format_reply(args[0], "C++ Twitch Bot : https://github.com/mrnoob17/twitch_bot"));
 }
 
+void batchest_callback(Bot* b, const Vector<String>& args)
+{
+    b->add_message(format_reply(args[0], "BatChest Count : " + std::to_string(b->batchest_count)));
+}
+
+void today_callback(Bot* b, const Vector<String>& args)
+{
+    if(!b->today.empty()){
+        b->add_message(format_reply(args[0], "Today : " + b->today));
+    }
+}
+
+void set_today_callback(Bot* b, const Vector<String>& args)
+{
+    b->today = "";
+    for(int i = 1; i < args.size(); i++){
+        b->today += args[i] + " ";
+    }
+}
+
+void founder_callback(Bot* b, const Vector<String>& args)
+{
+    b->add_message(format_reply(args[0], "You're a founder... founder of deez nuts! GOTTEM"));
+}
+
+void mod_callback(Bot* b, const Vector<String>& args)
+{
+    b->add_message(format_reply(args[0], "You're a moderator, protector of deez nuts GOTTEM"));
+}
+
+void pleb_callback(Bot* b, const Vector<String>& args)
+{
+    b->add_message(format_reply(args[0], "You're a pleb, cultivator of deez nuts GOTTEM"));
+}
+
+void sub_callback(Bot* b, const Vector<String>& args)
+{
+    b->add_message(format_reply(args[0], "You're a subscriber, nourisher of deez nuts GOTTEM"));
+}
+
 void start_bot(int args, const char** argc)
 {
     if(args < 2)
@@ -808,17 +779,27 @@ void start_bot(int args, const char** argc)
         return;
     }
 
+    BROADCASTER_NAME = argc[1];
+
     curl_handle = curl_easy_init();
 
-    broadcaster_name = argc[1];
-
+    Bot bot;
     {
         std::ifstream file {"token.nut"};
-        file>>auth_token;
-        file>>youtube_api_key;
+        file>>CLIENT_ID;
+        file>>AUTH_TOKEN;
+        file>>YOUTUBE_API_KEY;
     }
 
-    Bot bot;
+    {
+        std::ifstream file {"banned_words.txt"};
+        String line;
+        Pair<String, int> p;
+        while(file>>p.first>>p.second){
+            bot.banned_words.push_back(p);
+        }
+    }
+    
     bot.experimental = true;
 
     bot.add_command("commands", commands_callback); 
@@ -838,8 +819,25 @@ void start_bot(int args, const char** argc)
     bot.add_command("sc", music_count_callback); 
     bot.add_command("song", song_callback); 
     bot.add_command("bot", bot_callback); 
+    bot.add_command("batchest", batchest_callback); 
+    bot.add_command("today", today_callback); 
+    bot.add_command("settoday", set_today_callback, {moderator_badge, broadcaster_badge}); 
+    bot.add_command("founder", founder_callback, {founder_badge}); 
+    bot.add_command("mod", mod_callback, {moderator_badge}); 
+    bot.add_command("sub", sub_callback, {subscriber_badge}); 
+    bot.add_command("pleb", pleb_callback, {}, true); 
 
     bot.connection_id = bot.end_point.connect("ws://irc-ws.chat.twitch.tv:80");
+
+    {
+        curl_easy_reset(curl_handle);
+        auto list {set_curl_headers(("Authorization: Bearer " + AUTH_TOKEN).c_str(),
+                                    ("Client-Id: " + CLIENT_ID).c_str())};
+
+        String s {curl_call(("https://api.twitch.tv/helix/users?login=" + BROADCASTER_NAME).c_str(), curl_handle, list)};
+        BROADCASTER_ID = json_get_value_naive("id", s);
+        curl_slist_free_all(list);
+    }
 
     printf("%i\n", bot.connection_id);
     if(bot.connection_id == -1){
@@ -889,7 +887,7 @@ void start_bot(int args, const char** argc)
             {
                 if(bot.handle->joined)
                 {
-                    bot.add_message("PRIVMSG #" + broadcaster_name + " :coffee481Happy BatChest coffee481Happy\r\n");
+                    bot.add_message("PRIVMSG #" + BROADCASTER_NAME + " :coffee481Happy BatChest coffee481Happy\r\n");
                     said_welcome_message = true;
                 }
             }
@@ -903,12 +901,12 @@ int main(int args, const char** argc)
 {
 
     // TODO
+    // settitle
     // tts and tiktok api
-    // batchest counter
-    // today command
     // follow notif
     // sub notif
     // point system
+    // social credit system
     // raid notif
 
     start_bot(args, argc);
