@@ -65,6 +65,17 @@ String format_send(const String& message)
     return "PRIVMSG #" + BROADCASTER_NAME + " :" + message + "\r\n";
 }
 
+String tts_streamelements_text_format(const String& data)
+{
+    auto vec {tokenize(data)};
+    String result;
+    for(auto& s : vec){
+        result += s + '+';
+    }
+    result.pop_back();
+    return result;
+}
+
 Parsed_Message parse_message(const String& msg)
 {
     if(msg.find("PRIVMSG") == msg.npos){
@@ -364,6 +375,8 @@ struct Websocket_Endpoint
     websocketpp::lib::shared_ptr<websocketpp::lib::thread> thread;
 };
 
+
+
 struct User
 {
     String nick;
@@ -474,15 +487,43 @@ struct Bot
                     if(s == "notification")
                     {
                         s = json_get_value_naive("subscription_type", data);
+                        String message;
                         if(s == "channel.follow")
                         {
                             s = json_get_value_naive("user_name", data);
-                            add_message(format_reply_2("Yow lil bro! Thanks for the follow!", s));
+                            auto user_login {json_get_value_naive("user_login", data)};
+                            auto found {false};
+                            for(auto& u : already_thanks_for_the_follow)
+                            {
+                                if(u == user_login)
+                                {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if(!found)
+                            {
+                                add_message(format_reply_2("Yo lil bro! Thanks for the follow!", s));
+                                message = tts_streamelements_text_format(s + " thanks for the follow lil bro!");
+                                already_thanks_for_the_follow.push_back(user_login);
+                                std::ofstream file {already_followed, std::ios::app};
+                                file<<user_login<<'\n';
+                            }
                         }
                         else if(s == "channel.subscribe" || s == "channel.subscription.message")
                         {
                             s = json_get_value_naive("user_name", data);
-                            add_message(format_reply_2("Yow lil bro! Thanks for subbing!", s));
+                            add_message(format_reply_2("Yo lil bro! Thanks for subbing!", s));
+                            message = tts_streamelements_text_format(s + " thanks for the subbing lil bro!");
+                        }
+                        if(!message.empty())
+                        {
+                            auto thank_you {tts_from_streamelements("Brian", message)};
+                            if(thank_you.tts)
+                            {
+                                std::lock_guard<std::mutex> g {sound_mutex};
+                                sounds_to_play.push_back(thank_you);
+                            }
                         }
                     }
                 }
@@ -535,9 +576,9 @@ struct Bot
                 String str;
                 for(const auto& s : tokens)
                 {
-                    if(s == "BatChest"){
-                        batchest_count++;
-                    }
+                    //if(s == "BatChest"){
+                    //    batchest_count++;
+                    //}
                     str += s;
                     str += ' ';
                 }
@@ -642,6 +683,24 @@ struct Bot
         return nullptr;
     }
 
+    Sound_To_Play tts_from_streamelements(String voice, const String& phrase)
+    {
+        std::lock_guard<std::mutex> gg {curl_mutex};
+        curl_easy_reset(curl_handle);
+        Sound_To_Play play;
+        voice[0] = toupper(voice[0]);
+        String url {"https://api.streamelements.com/kappa/v2/speech?voice=" + voice + "&text="};
+        const String data {curl_call(url + phrase, curl_handle)};
+
+        auto rwops {SDL_RWFromConstMem((void*)data.data(), data.length())};
+        if(rwops)
+        {
+            play.tts = Mix_LoadWAV_RW(rwops, 0);
+            SDL_RWclose(rwops);
+        }
+        return play;
+    };
+
     bool has_voice(const String s)
     {
         for(auto& v : voices)
@@ -742,30 +801,62 @@ struct Bot
         String line;
         String tag;
         String value;
-        std::ifstream file {data_file_name};
-        while(std::getline(file, line))
         {
-            clean_line(&line);
-            if(!line.empty())
+            std::ifstream file {data_file_name};
+            while(std::getline(file, line))
             {
-                extract_tag_and_value_from_line(line, &tag, &value);
-                if(tag == "batchest_count"){
-                    std::stringstream ss {value};
-                    ss>>batchest_count;
+                clean_line(&line);
+                if(!line.empty())
+                {
+                    extract_tag_and_value_from_line(line, &tag, &value);
+                    if(tag == "batchest_count"){
+                        std::stringstream ss {value};
+                        ss>>batchest_count;
+                    }
                 }
             }
         }
+
+        {
+            std::ifstream file {"banned_words.txt"};
+            Pair<String, int> p;
+            while(file>>p.first>>p.second){
+                banned_words.push_back(p);
+            }
+        }
+
+        {
+            std::ifstream file {already_followed};
+            while(std::getline(file, line))
+            {
+                clean_line(&line);
+                already_thanks_for_the_follow.push_back(line);
+            }
+        }
+
+        {
+            const String directory {"sounds/"};
+            sounds.reserve(100);
+            String file_name;
+            for(const auto& e : Files::directory_iterator(directory))
+            {
+                sounds.push_back({});
+                auto& s {sounds.back()};
+                s.name = e.path().filename().stem().string();
+                file_name = e.path().filename().string(); 
+                s.chunk = Mix_LoadWAV((directory + file_name).c_str());
+            }
+        }
+    
     }
 
-    void serialize_out()
+    void quit()
     {
-        std::ofstream file {data_file_name};
-        file<<"batchest_count : "<<batchest_count;
-    }
+        {
+            std::ofstream file {data_file_name};
+            //file<<"batchest_count : "<<batchest_count;
+        }
 
-    ~Bot()
-    {
-        serialize_out();
         for(auto& s : sounds)
         {
             if(s.chunk){
@@ -794,13 +885,15 @@ struct Bot
     Vector<String> voices;
     Vector<Sound> sounds;
     Vector<Sound_To_Play> sounds_to_play;
+    Vector<String> already_thanks_for_the_follow;
 
     Music_Info last_song;
     Vector<Music_Info> music_queue;
     Vector<Pair<String, int>> banned_words;
     Vector<User> current_users;
 
-    String data_file_name {"bot.txt"};
+    String already_followed {"already_followed.txt"};
+    String data_file_name   {"bot.txt"};
 
     std::mutex sound_mutex;
     std::mutex music_mutex;
@@ -874,28 +967,7 @@ void os_callback(Bot* b, const Vector<String>& args)
 
 void tts_callback(Bot* b, const Vector<String>& args)
 {
-    auto tts_from_streamelements {[](String voice, const String& phrase)
-    {
-        Bot::Sound_To_Play play;
-        voice[0] = toupper(voice[0]);
-        String url {"https://api.streamelements.com/kappa/v2/speech?voice=" + voice + "&text="};
-        const String data {curl_call(url + phrase, curl_handle)};
-
-        auto rwops {SDL_RWFromConstMem((void*)data.data(), data.length())};
-        if(rwops)
-        {
-            play.tts = Mix_LoadWAV_RW(rwops, 0);
-            SDL_RWclose(rwops);
-        }
-
-        return play;
-    }};
-
     std::lock_guard<std::mutex> g {b->sound_mutex};
-    std::lock_guard<std::mutex> gg {b->curl_mutex};
-    curl_easy_reset(curl_handle);
-    Vector<Bot::Sound_To_Play> tts_sounds;
-
     String global_phrase {};
 
     for(int i = 1; i < args.size(); i++)
@@ -932,7 +1004,7 @@ void tts_callback(Bot* b, const Vector<String>& args)
                 }
                 auto voice {stem};
                 voice[0] = toupper(voice[0]);
-                play = tts_from_streamelements(voice, phrase);
+                play = b->tts_from_streamelements(voice, phrase);
             }
             else
             {
@@ -985,7 +1057,7 @@ void tts_callback(Bot* b, const Vector<String>& args)
     if(!global_phrase.empty())
     {
         global_phrase.pop_back();
-        auto tts {tts_from_streamelements("Brian", global_phrase)};
+        auto tts {b->tts_from_streamelements("Brian", global_phrase)};
         if(tts.tts){
             b->sounds_to_play.push_back(tts);
         }
@@ -1160,24 +1232,11 @@ void sub_callback(Bot* b, const Vector<String>& args)
     b->add_message(format_reply(args[0], "You're a subscriber, nourisher of deez nuts GOTTEM"));
 }
 
-void start_bot(int args, const char** argc)
+void start_bot(Bot* _bot, int args, const char** argc)
 {
-    if(args < 2)
-    {
-        printf("no broadcaster name found");
-        return;
-    }
-
-    SDL_Init(SDL_INIT_AUDIO);
-    Mix_Init(MIX_INIT_MP3 | MIX_INIT_OGG);
-    Mix_OpenAudio(44000, MIX_DEFAULT_FORMAT, 2, 4096);
-    Mix_AllocateChannels(1000000);
-
     BROADCASTER_NAME = argc[1];
 
-    curl_handle = curl_easy_init();
-
-    Bot bot;
+    auto& bot {*_bot};
     {
         std::ifstream file {"token.nut"};
         file>>CLIENT_ID;
@@ -1196,30 +1255,8 @@ void start_bot(int args, const char** argc)
     }
 
 
-    {
-        std::ifstream file {"banned_words.txt"};
-        String line;
-        Pair<String, int> p;
-        while(file>>p.first>>p.second){
-            bot.banned_words.push_back(p);
-        }
-    }
-    
-    {
-        const String directory {"sounds/"};
-        bot.sounds.reserve(100);
-        String file_name;
-        for(const auto& e : Files::directory_iterator(directory))
-        {
-            bot.sounds.push_back({});
-            auto& s {bot.sounds.back()};
-            s.name = e.path().filename().stem().string();
-            file_name = e.path().filename().string(); 
-            s.chunk = Mix_LoadWAV((directory + file_name).c_str());
-        }
-    }
-
     bot.experimental = true;
+    bot.serialize_in();
 
     bot.voices = {"brian",
                   "filiz",
@@ -1343,12 +1380,16 @@ void start_bot(int args, const char** argc)
             std::this_thread::sleep_for(std::chrono::milliseconds(sleep_time));
         }
     }
-    curl_easy_cleanup(curl_handle);
-    SDL_Quit();
 }
 
 int main(int args, const char** argc)
 {
+
+    if(args < 2)
+    {
+        printf("no broadcaster name found");
+        return 0;
+    }
 
     // TODO
     // follow notif
@@ -1359,7 +1400,20 @@ int main(int args, const char** argc)
     // social credit system
     // raid notif
 
-    start_bot(args, argc);
+    Bot bot;
+
+    SDL_Init(SDL_INIT_AUDIO);
+    Mix_Init(MIX_INIT_MP3 | MIX_INIT_OGG);
+    Mix_OpenAudio(44000, MIX_DEFAULT_FORMAT, 2, 4096);
+    Mix_AllocateChannels(1000000);
+
+    curl_handle = curl_easy_init();
+
+    start_bot(&bot, args, argc);
     
+    bot.quit();
+    curl_easy_cleanup(curl_handle);
+    SDL_Quit();
+
     return 0;
 }
