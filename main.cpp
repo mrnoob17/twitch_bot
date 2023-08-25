@@ -391,7 +391,8 @@ struct Bot
     {
         bool played {false};
         int channel;
-        Sound* sound;
+        Sound* sound {nullptr};
+        Mix_Chunk* tts {nullptr};
         int loops {0};
         int volume {MIX_MAX_VOLUME / 4};
     };
@@ -518,6 +519,9 @@ struct Bot
                     {
                         tokens.erase(tokens.begin());
                         tokens.insert(tokens.begin(), sender.nick);
+                        if(tokens.back() == "≤áÇÇ"){
+                            tokens.pop_back();
+                        }
                         auto t {std::thread(c->callback, this, tokens)};
                         t.detach();
                     }
@@ -606,12 +610,21 @@ struct Bot
             if(!s.played)
             {
                 s.played = true;
-                s.channel = Mix_PlayChannel(-1, s.sound->chunk, s.loops);
+                if(s.sound){
+                    s.channel = Mix_PlayChannel(-1, s.sound->chunk, s.loops);
+                }
+                else{
+                    s.channel = Mix_PlayChannel(-1, s.tts, s.loops);
+                }
                 Mix_Volume(s.channel, s.volume);
             }
             else
             {
-                if(!Mix_Playing(s.channel)){
+                if(!Mix_Playing(s.channel))
+                {
+                    if(s.tts){
+                        Mix_FreeChunk(s.tts);
+                    }
                     sounds_to_play.erase(sounds_to_play.begin());
                 }
             }
@@ -627,6 +640,17 @@ struct Bot
             }
         }
         return nullptr;
+    }
+
+    bool has_voice(const String s)
+    {
+        for(auto& v : voices)
+        {
+            if(v == s){
+                return true;
+            }
+        }
+        return false;
     }
 
     bool music_playing()
@@ -767,6 +791,7 @@ struct Bot
     String today;
     String event_sub_session_id;
 
+    Vector<String> voices;
     Vector<Sound> sounds;
     Vector<Sound_To_Play> sounds_to_play;
 
@@ -849,21 +874,78 @@ void os_callback(Bot* b, const Vector<String>& args)
 
 void tts_callback(Bot* b, const Vector<String>& args)
 {
+    auto tts_from_streamelements {[](String voice, const String& phrase)
+    {
+        Bot::Sound_To_Play play;
+        voice[0] = toupper(voice[0]);
+        String url {"https://api.streamelements.com/kappa/v2/speech?voice=" + voice + "&text="};
+        const String data {curl_call(url + phrase, curl_handle)};
+
+        auto rwops {SDL_RWFromConstMem((void*)data.data(), data.length())};
+        if(rwops)
+        {
+            play.tts = Mix_LoadWAV_RW(rwops, 0);
+            SDL_RWclose(rwops);
+        }
+
+        return play;
+    }};
+
     std::lock_guard<std::mutex> g {b->sound_mutex};
-    String n {};
+    std::lock_guard<std::mutex> gg {b->curl_mutex};
+    curl_easy_reset(curl_handle);
+    Vector<Bot::Sound_To_Play> tts_sounds;
+
+    String global_phrase {};
+
     for(int i = 1; i < args.size(); i++)
     {
         const auto& s {args[i]};
+
         if(s[0] == '-' || s[0] == '+')
         {
             Bot::Sound_To_Play play;
             auto pipe {s.find('|')};
             auto pipe2 {s.find('|', pipe + 1)};
-            n = s.substr(1, pipe - 1);
-            auto sound {b->get_sound(n)};
-            if(sound)
+            auto stem {s.substr(1, pipe - 1)};
+
+            if(b->has_voice(stem))
             {
-                play.sound = sound;
+                String phrase {};
+                int j;
+                for(j = i + 1; j < args.size(); j++)
+                {
+                    // TODO if valid sound or voice continue else keep adding to the phrase
+
+                    if(args[j][0] == '-' || args[j][0] == '+')
+                    {
+                        i = j - 1;
+                        break;
+                    }
+                    phrase += args[j];
+                    if(j != args.size() - 1){
+                        phrase += '+';
+                    }
+                }
+                if(j == args.size()){
+                    i = j;
+                }
+                auto voice {stem};
+                voice[0] = toupper(voice[0]);
+                play = tts_from_streamelements(voice, phrase);
+            }
+            else
+            {
+                auto sound {b->get_sound(stem)};
+                if(sound){
+                    play.sound = sound;
+                }
+                else{
+                    global_phrase += stem + '+';
+                }
+            }
+            if(play.sound || play.tts)
+            {
                 if(pipe != String::npos)
                 {
                     float f;
@@ -895,6 +977,17 @@ void tts_callback(Bot* b, const Vector<String>& args)
                     Mix_Volume(play.channel, play.volume);
                 }
             }
+        }
+        else{
+            global_phrase += s + '+';
+        }
+    }
+    if(!global_phrase.empty())
+    {
+        global_phrase.pop_back();
+        auto tts {tts_from_streamelements("Brian", global_phrase)};
+        if(tts.tts){
+            b->sounds_to_play.push_back(tts);
         }
     }
 }
@@ -1127,6 +1220,17 @@ void start_bot(int args, const char** argc)
     }
 
     bot.experimental = true;
+
+    bot.voices = {"brian",
+                  "filiz",
+                  "astrid",
+                  "tatyana",
+                  "maxim",
+                  "carmen",
+                  "ines",
+                  "cristiano",
+                  "vitoria",
+                  "ricardo"};
 
     bot.add_command("commands", commands_callback); 
     bot.add_command("stack", stack_callback); 

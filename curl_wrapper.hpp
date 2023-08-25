@@ -55,7 +55,7 @@ inline String curl_call(const String& s, CURL* handle, curl_slist* list = nullpt
 
         res = curl_easy_perform(handle);
     }
-    String str {chunk.response}; 
+    String str {chunk.response, chunk.response + chunk.size}; 
     free(chunk.response);
     return str;
 }
