@@ -1,14 +1,21 @@
 // c++ twitch bot
+#define SDL_MAIN_HANDLED
 #define ASIO_STANDALONE
 #define ASIO_HAS_THREADS
 #define CURL_STATICLIB
  
-#include "websocketpp/config/asio_no_tls_client.hpp"
+#include "websocketpp/config/asio_client.hpp"
 
 #include "websocketpp/client.hpp"
 
+#include <SDL.h>
+#include <SDL_mixer.h>
+
 #include <cstdio>
 #include <fstream>
+#include <filesystem>
+
+namespace Files = std::filesystem;
 
 #include "curl_wrapper.hpp"
 #include "types.hpp"
@@ -18,7 +25,7 @@
 
 CURL* curl_handle {nullptr};
 
-using Client = websocketpp::client<websocketpp::config::asio_client>;
+using Client = websocketpp::client<websocketpp::config::asio_tls_client>;
 using Connection_Handle = websocketpp::connection_hdl;
 using Connection_Pointer = Client::connection_ptr;
 
@@ -149,10 +156,13 @@ struct Connection_Metadata
         auto cptr {c->get_con_from_hdl(handle)}; 
         server = cptr->get_response_header("Server");
 
-        c->send(handle, "CAP REQ :twitch.tv/membership twitch.tv/tags twitch.tv/commands\r\n", websocketpp::frame::opcode::text);
-        c->send(handle, "PASS oauth:" + AUTH_TOKEN + "\r\n", websocketpp::frame::opcode::text);
-        c->send(handle, "NICK " + BROADCASTER_NAME + "\r\n", websocketpp::frame::opcode::text);
-        c->send(handle, "JOIN #" + BROADCASTER_NAME + "\r\n", websocketpp::frame::opcode::text);
+        if(irc_connector)
+        {
+            c->send(handle, "CAP REQ :twitch.tv/membership twitch.tv/tags twitch.tv/commands\r\n", websocketpp::frame::opcode::text);
+            c->send(handle, "PASS oauth:" + AUTH_TOKEN + "\r\n", websocketpp::frame::opcode::text);
+            c->send(handle, "NICK " + BROADCASTER_NAME + "\r\n", websocketpp::frame::opcode::text);
+            c->send(handle, "JOIN #" + BROADCASTER_NAME + "\r\n", websocketpp::frame::opcode::text);
+        }
     }
     
     void on_fail(Client* c, Connection_Handle handle)
@@ -161,7 +171,7 @@ struct Connection_Metadata
         auto cptr {c->get_con_from_hdl(handle)}; 
         server = cptr->get_response_header("Server");
         why_failed = cptr->get_ec().message();
-
+        printf("%s\n", why_failed.c_str());
     }
 
     void on_close(Client * c, websocketpp::connection_hdl hdl) {
@@ -172,15 +182,19 @@ struct Connection_Metadata
           << websocketpp::close::status::get_string(con->get_remote_close_code()) 
           << "), close reason: " << con->get_remote_close_reason();
         why_failed = s.str();
+        printf("%s\n", why_failed.c_str());
     }
 
     void on_message(Connection_Handle, Client::message_ptr msg)
     {
-        const auto& pay_load {msg->get_payload()};
+        std::lock_guard<std::mutex> g {message_mutex};
+        auto pay_load {msg->get_payload()};
         if(msg->get_opcode() == websocketpp::frame::opcode::text)
         {
-            messages.push_back("<< " + pay_load);
-            if(messages.back().find("JOIN") != String::npos){
+            if(!irc_connector){
+                messages.push_back("<< " + pay_load);
+            }
+            if(pay_load.find("JOIN") != String::npos){
                 joined = true;
             }
             auto parsed_message {parse_message(pay_load)};
@@ -198,13 +212,17 @@ struct Connection_Metadata
                 }
             }
         }
-        else{
-            messages.push_back("<< " + websocketpp::utility::to_hex(pay_load));
+        else
+        {
+            pay_load = websocketpp::utility::to_hex(pay_load);
+            if(!irc_connector){
+                messages.push_back("<< " + pay_load);
+            }
         }
-        printf("%s", messages.back().c_str());
+        printf("%s : %s\n", name.c_str(), pay_load.c_str());
     }
     void record_sent_message(String message) {
-        messages.push_back(">> " + message);
+        //messages.push_back(">> " + message);
     }
 
     int id;
@@ -212,6 +230,9 @@ struct Connection_Metadata
     String uri;
     String status;
     String server;
+    String name;
+    bool irc_connector;
+    std::mutex message_mutex;
     Vector<String> messages;
     Vector<Parsed_Message> priv_messages;
     Vector<String> ping_messages;
@@ -227,11 +248,35 @@ struct Websocket_Endpoint
         end_point.clear_error_channels(websocketpp::log::elevel::all);
 
         end_point.init_asio();
+
+        end_point.set_tls_init_handler(websocketpp::lib::bind(on_tls_init));
+
         end_point.start_perpetual();
 
         thread = websocketpp::lib::make_shared<websocketpp::lib::thread>(&Client::run, &end_point);
     }
-    int connect(String const & uri)
+
+    using context_ptr = std::shared_ptr<asio::ssl::context>;
+
+	static context_ptr on_tls_init()
+	{
+		context_ptr ctx = std::make_shared<asio::ssl::context>(asio::ssl::context::sslv23);
+
+		try {
+			ctx->set_options(
+				asio::ssl::context::default_workarounds
+				| asio::ssl::context::no_sslv2
+				| asio::ssl::context::no_sslv3
+				| asio::ssl::context::single_dh_use
+			);
+
+		} catch (std::exception &e)
+		{
+			std::cout << "Error in context pointer: " << e.what() << std::endl;
+		}
+		return ctx;
+	}
+    int connect(String const & uri, const String& name, const bool irc_connector = true)
     {
         websocketpp::lib::error_code ec;
 
@@ -246,6 +291,8 @@ struct Websocket_Endpoint
         auto new_id {next_id++};
         auto metadata_ptr {websocketpp::lib::make_shared<Connection_Metadata>(new_id, con->get_handle(), uri)};
         connection_list[new_id] = metadata_ptr;
+        metadata_ptr->name = name;
+        metadata_ptr->irc_connector = irc_connector;
 
         con->set_open_handler(websocketpp::lib::bind(
             &Connection_Metadata::on_open,
@@ -317,10 +364,38 @@ struct Websocket_Endpoint
     websocketpp::lib::shared_ptr<websocketpp::lib::thread> thread;
 };
 
-struct Bot;
+struct User
+{
+    String nick;
+    String host;
+    String login_name;
+    String user_id;
+    String badges;
+};
 
 struct Bot
 {
+    struct Music_Info
+    {
+        Youtube_Video_Info video;
+        Vector<String> args;
+    };
+
+    struct Sound
+    {
+        String name;
+        Mix_Chunk* chunk {nullptr};
+    };
+
+    struct Sound_To_Play
+    {
+        bool played {false};
+        int channel;
+        Sound* sound;
+        int loops {0};
+        int volume {MIX_MAX_VOLUME / 4};
+    };
+
     using Callback = void(*)(Bot*, const Vector<String>& args);
 
     struct Command
@@ -354,6 +429,64 @@ struct Bot
 
     void check_messages()
     {
+        {
+            std::lock_guard<std::mutex> g {event_sub_handle->message_mutex};
+            if(!event_sub_handle->messages.empty())
+            {
+                if(event_sub_session_id.empty())
+                {
+                    auto ctr {0};
+                    for(const auto& s : event_sub_handle->messages)
+                    {
+                        event_sub_session_id = json_get_value_naive("id", s);
+                        clean_line(&event_sub_session_id);
+                        if(!event_sub_session_id.empty()){
+                            break;
+                        }
+                        ctr++;
+                    }
+                    if(!event_sub_session_id.empty())
+                    {
+                        subscribe_to_event("channel.follow",
+                                            2,
+                                            wrap_in_quotes("condition") + ":{" + 
+                                            wrap_in_quotes("broadcaster_user_id") + ":" + wrap_in_quotes(BROADCASTER_ID) + "," +
+                                            wrap_in_quotes("moderator_user_id") + ":" + wrap_in_quotes(BROADCASTER_ID) + "}");
+
+                        subscribe_to_event("channel.subscribe",
+                                            1,
+                                            wrap_in_quotes("condition") + ":{" + 
+                                            wrap_in_quotes("broadcaster_user_id") + ":" + wrap_in_quotes(BROADCASTER_ID) + "}");
+
+                        event_sub_handle->messages.erase(event_sub_handle->messages.begin() + ctr);
+                    }
+                }
+                else
+                {
+                    auto data {event_sub_handle->messages.front()};
+                    auto s {json_get_value_naive("message_type", data)};
+
+                    event_sub_handle->messages.erase(event_sub_handle->messages.begin());
+                    //twitch follow notif
+                    //Event Sub : {"metadata":{"message_id":"k1SWN3SGe2BeNYxkD_cjR4maZ99PDRDd6Zx48W9t5qw=","message_type":"notification","message_timestamp":"2023-08-25T16:21:23.993248783Z","subscription_type":"channel.follow","subscription_version":"2"},"payload":{"subscription":{"id":"0929c6e1-c008-4c2f-ab6c-8d236d46afde","status":"enabled","type":"channel.follow","version":"2","condition":{"broadcaster_user_id":"445242086","moderator_user_id":"445242086"},"transport":{"method":"websocket","session_id":"AgoQU9piiL9nShG3bjSWvTLfqBIGY2VsbC1i"},"created_at":"2023-08-25T13:01:47.909083114Z","cost":0},"event":{"user_id":"726187387","user_login":"555gerson555","user_name":"555gerson555","broadcaster_user_id":"445242086","broadcaster_user_login":"coffee_lava","broadcaster_user_name":"coffee_lava","followed_at":"2023-08-25T16:21:23.993240695Z"}}}
+
+                    if(s == "notification")
+                    {
+                        s = json_get_value_naive("subscription_type", data);
+                        if(s == "channel.follow")
+                        {
+                            s = json_get_value_naive("user_name", data);
+                            add_message(format_reply_2("Yow lil bro! Thanks for the follow!", s));
+                        }
+                        else if(s == "channel.subscribe" || s == "channel.subscription.message")
+                        {
+                            s = json_get_value_naive("user_name", data);
+                            add_message(format_reply_2("Yow lil bro! Thanks for subbing!", s));
+                        }
+                    }
+                }
+            }
+        } 
         if(!handle->priv_messages.empty())
         {
             const auto& sender {handle->priv_messages.front()};
@@ -430,7 +563,7 @@ struct Bot
             auto& pong {handle->ping_messages.front()};
             pong[1] = 'O';
             add_message(pong);
-            printf("%s", pong.c_str());
+            printf("%s\n", pong.c_str());
             handle->ping_messages.erase(handle->ping_messages.begin());
         }
     }
@@ -462,6 +595,38 @@ struct Bot
                 }
             }
         }
+    }
+
+    void check_sounds_to_play()
+    {
+        std::lock_guard<std::mutex> g {sound_mutex};
+        if(!sounds_to_play.empty())
+        {
+            auto& s {sounds_to_play.front()};
+            if(!s.played)
+            {
+                s.played = true;
+                s.channel = Mix_PlayChannel(-1, s.sound->chunk, s.loops);
+                Mix_Volume(s.channel, s.volume);
+            }
+            else
+            {
+                if(!Mix_Playing(s.channel)){
+                    sounds_to_play.erase(sounds_to_play.begin());
+                }
+            }
+        }
+    }
+
+    Sound* get_sound(const String s)
+    {
+        for(auto& sound : sounds)
+        {
+            if(sound.name == s){
+                return &sound;
+            }
+        }
+        return nullptr;
     }
 
     bool music_playing()
@@ -522,6 +687,32 @@ struct Bot
         curl_slist_free_all(list);
     }
 
+    void subscribe_to_event(const String& s, const int v, const String& c)
+    {
+        std::lock_guard<std::mutex> guard {curl_mutex};
+        curl_easy_reset(curl_handle);
+
+        String url {"https://api.twitch.tv/helix/eventsub/subscriptions"}; 
+
+        auto list {set_curl_headers(("Authorization: Bearer " + AUTH_TOKEN).c_str(),
+                                    ("Client-Id: " + CLIENT_ID).c_str(),
+                                    "Content-Type: application/json")};
+
+        curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, list);
+
+        String post_fields;
+        post_fields = "{" + wrap_in_quotes("type") + ":" + wrap_in_quotes(s) + "," +
+                            wrap_in_quotes("version") + ":" + wrap_in_quotes(std::to_string(v)) + "," +
+                            c + "," + 
+                            wrap_in_quotes("transport") + ":" + "{" + wrap_in_quotes("method") + ":" + wrap_in_quotes("websocket") + "," +
+                                                                      wrap_in_quotes("session_id") + ":" + wrap_in_quotes(event_sub_session_id) +"}}";
+
+        curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, post_fields.c_str());
+
+        auto response {curl_call(url, curl_handle, list)};
+        curl_slist_free_all(list);
+    }
+
     void serialize_in()
     {
         String line;
@@ -551,15 +742,20 @@ struct Bot
     ~Bot()
     {
         serialize_out();
+        for(auto& s : sounds)
+        {
+            if(s.chunk){
+                Mix_FreeChunk(s.chunk);
+            }
+        }
     }
 
     bool experimental {false};
 
     int connection_id;
-    std::mutex music_mutex;
-    std::mutex send_mutex;
-    std::mutex curl_mutex;
+    int event_sub_connection_id;
     Connection_Metadata::Pointer handle;
+    Connection_Metadata::Pointer event_sub_handle;
     Websocket_Endpoint end_point;
     Stamp last_music_stamp;
     std::thread music_thread;
@@ -569,18 +765,22 @@ struct Bot
 
     u64 batchest_count {0};
     String today;
+    String event_sub_session_id;
 
-    struct Music_Info
-    {
-        Youtube_Video_Info video;
-        Vector<String> args;
-    };
+    Vector<Sound> sounds;
+    Vector<Sound_To_Play> sounds_to_play;
 
     Music_Info last_song;
     Vector<Music_Info> music_queue;
     Vector<Pair<String, int>> banned_words;
+    Vector<User> current_users;
 
     String data_file_name {"bot.txt"};
+
+    std::mutex sound_mutex;
+    std::mutex music_mutex;
+    std::mutex send_mutex;
+    std::mutex curl_mutex;
 };
 
 void commands_callback(Bot* b, const Vector<String>& args)
@@ -647,6 +847,58 @@ void os_callback(Bot* b, const Vector<String>& args)
    b->add_message(format_reply(args[0], "OS : not linux baseg"));
 }
 
+void tts_callback(Bot* b, const Vector<String>& args)
+{
+    std::lock_guard<std::mutex> g {b->sound_mutex};
+    String n {};
+    for(int i = 1; i < args.size(); i++)
+    {
+        const auto& s {args[i]};
+        if(s[0] == '-' || s[0] == '+')
+        {
+            Bot::Sound_To_Play play;
+            auto pipe {s.find('|')};
+            auto pipe2 {s.find('|', pipe + 1)};
+            n = s.substr(1, pipe - 1);
+            auto sound {b->get_sound(n)};
+            if(sound)
+            {
+                play.sound = sound;
+                if(pipe != String::npos)
+                {
+                    float f;
+                    if(pipe2 == String::npos){
+                        f = string_to_float(s.substr(pipe + 1, String::npos));
+                    }
+                    else{
+                        f = string_to_float(s.substr(pipe + 1, pipe2 - pipe));
+                    }
+                    play.volume = (float)play.volume * f;
+                }
+                if(pipe2 != String::npos)
+                {
+                    play.loops = string_to_int(s.substr(pipe2 + 1, String::npos));
+                    if(play.loops > 5){
+                        play.loops = 5;
+                    }
+                    if(play.loops < 0){
+                        play.loops = 0;
+                    }
+                }
+                if(s[0] == '-'){
+                    b->sounds_to_play.push_back(play);
+                }
+                else
+                {
+                    play.loops = 0;
+                    play.channel = Mix_PlayChannel(-1, play.sound->chunk, play.loops);
+                    Mix_Volume(play.channel, play.volume);
+                }
+            }
+        }
+    }
+}
+
 void music_callback(Bot* b, const Vector<String>& args)
 {
 
@@ -710,6 +962,20 @@ void skip_song_callback(Bot* b, const Vector<String>& args)
         }
         else{
             b->add_message(format_reply(args[0], "Clueless can't skip other people's songs"));
+        }
+    }
+}
+
+void skip_sound_callback(Bot* b, const Vector<String>& args)
+{
+    std::lock_guard<std::mutex> g {b->sound_mutex};
+    if(!b->sounds_to_play.empty())
+    {
+        auto& s {b->sounds_to_play.front()};
+        if(s.played)
+        {
+            Mix_HaltChannel(s.channel);
+            b->sounds_to_play.erase(b->sounds_to_play.begin());
         }
     }
 }
@@ -809,6 +1075,11 @@ void start_bot(int args, const char** argc)
         return;
     }
 
+    SDL_Init(SDL_INIT_AUDIO);
+    Mix_Init(MIX_INIT_MP3 | MIX_INIT_OGG);
+    Mix_OpenAudio(44000, MIX_DEFAULT_FORMAT, 2, 4096);
+    Mix_AllocateChannels(1000000);
+
     BROADCASTER_NAME = argc[1];
 
     curl_handle = curl_easy_init();
@@ -822,45 +1093,6 @@ void start_bot(int args, const char** argc)
     }
 
     {
-        std::ifstream file {"banned_words.txt"};
-        String line;
-        Pair<String, int> p;
-        while(file>>p.first>>p.second){
-            bot.banned_words.push_back(p);
-        }
-    }
-    
-    bot.experimental = true;
-
-    bot.add_command("commands", commands_callback); 
-    bot.add_command("stack", stack_callback); 
-    bot.add_command("drop", drop_callback); 
-    bot.add_command("discord", discord_callback); 
-    bot.add_command("game", game_callback); 
-    bot.add_command("editor", editor_callback); 
-    bot.add_command("engine", engine_callback); 
-    bot.add_command("font", font_callback); 
-    bot.add_command("keyboard", keyboard_callback); 
-    bot.add_command("vimconfig", vimconfig_callback); 
-    bot.add_command("friends", friends_callback); 
-    bot.add_command("os", os_callback); 
-    bot.add_command("sr", music_callback); 
-    bot.add_command("skip", skip_song_callback); 
-    bot.add_command("sc", music_count_callback); 
-    bot.add_command("song", song_callback); 
-    bot.add_command("bot", bot_callback); 
-    bot.add_command("batchest", batchest_callback); 
-    bot.add_command("today", today_callback); 
-    bot.add_command("settoday", set_today_callback, {moderator_badge, broadcaster_badge}); 
-    bot.add_command("settitle", set_title_callback, {broadcaster_badge, moderator_badge}); 
-    bot.add_command("founder", founder_callback, {founder_badge}); 
-    bot.add_command("mod", mod_callback, {moderator_badge}); 
-    bot.add_command("sub", sub_callback, {subscriber_badge}); 
-    bot.add_command("pleb", pleb_callback, {}, true); 
-
-    bot.connection_id = bot.end_point.connect("ws://irc-ws.chat.twitch.tv:80");
-
-    {
         curl_easy_reset(curl_handle);
         auto list {set_curl_headers(("Authorization: Bearer " + AUTH_TOKEN).c_str(),
                                     ("Client-Id: " + CLIENT_ID).c_str())};
@@ -870,18 +1102,89 @@ void start_bot(int args, const char** argc)
         curl_slist_free_all(list);
     }
 
+
+    {
+        std::ifstream file {"banned_words.txt"};
+        String line;
+        Pair<String, int> p;
+        while(file>>p.first>>p.second){
+            bot.banned_words.push_back(p);
+        }
+    }
+    
+    {
+        const String directory {"sounds/"};
+        bot.sounds.reserve(100);
+        String file_name;
+        for(const auto& e : Files::directory_iterator(directory))
+        {
+            bot.sounds.push_back({});
+            auto& s {bot.sounds.back()};
+            s.name = e.path().filename().stem().string();
+            file_name = e.path().filename().string(); 
+            s.chunk = Mix_LoadWAV((directory + file_name).c_str());
+        }
+    }
+
+    bot.experimental = true;
+
+    bot.add_command("commands", commands_callback); 
+    bot.add_command("stack", stack_callback); 
+    bot.add_command("drop", drop_callback); 
+    //bot.add_command("discord", discord_callback); 
+    //bot.add_command("game", game_callback); 
+    //bot.add_command("editor", editor_callback); 
+    //bot.add_command("engine", engine_callback); 
+    //bot.add_command("font", font_callback); 
+    //bot.add_command("keyboard", keyboard_callback); 
+    //bot.add_command("vimconfig", vimconfig_callback); 
+    //bot.add_command("friends", friends_callback); 
+    //bot.add_command("os", os_callback); 
+    //bot.add_command("tts", tts_callback); 
+    //bot.add_command("sr", music_callback); 
+    //bot.add_command("skip", skip_song_callback); 
+    //bot.add_command("sc", music_count_callback); 
+    //bot.add_command("ss", skip_sound_callback, {broadcaster_badge, vip_badge, moderator_badge});
+    //bot.add_command("song", song_callback); 
+    //bot.add_command("bot", bot_callback); 
+    //bot.add_command("batchest", batchest_callback); 
+    //bot.add_command("today", today_callback); 
+    //bot.add_command("settoday", set_today_callback, {moderator_badge, broadcaster_badge}); 
+    //bot.add_command("settitle", set_title_callback, {broadcaster_badge, moderator_badge}); 
+    //bot.add_command("founder", founder_callback, {founder_badge}); 
+    //bot.add_command("mod", mod_callback, {moderator_badge}); 
+    //bot.add_command("sub", sub_callback, {subscriber_badge}); 
+    //bot.add_command("pleb", pleb_callback, {}, true); 
+
+    bot.connection_id = bot.end_point.connect("wss://irc-ws.chat.twitch.tv:443", "Twitch API");
+    bot.event_sub_connection_id = bot.end_point.connect("wss://eventsub.wss.twitch.tv/ws", "Event Sub", false);
+
     printf("%i\n", bot.connection_id);
-    if(bot.connection_id == -1){
+    printf("%i\n", bot.event_sub_connection_id);
+    if(bot.connection_id == -1 || bot.event_sub_connection_id == -1){
         printf("connection failed");
     }
     else
     {
         bot.handle = bot.end_point.connection_list[bot.connection_id];
+
+        bot.event_sub_handle = bot.end_point.connection_list[bot.event_sub_connection_id];
+
         auto running {true};
         std::atomic<bool> said_welcome_message {false};
 
         const auto sleep_time {100};
 
+        //auto spawn_daemon_thread {[&]<typename U>(U u)
+        //{
+        //    auto t {std::thread([&](U f, Bot* b){
+        //        f();
+        //        std::this_thread::sleep_for(std::chrono::milliseconds(sleep_time));
+        //    })};
+        //    t.detach();
+        //}};
+        //spawn_daemon_thread();
+        
         auto message_thread {std::thread([&](Bot* b)
         {
             while(true)
@@ -912,6 +1215,17 @@ void start_bot(int args, const char** argc)
         }, &bot)};
         send_thread.detach();
 
+        auto sound_thread {std::thread([&](Bot* b)
+        {
+            while(true)
+            {
+                b->check_sounds_to_play();
+                std::this_thread::sleep_for(std::chrono::milliseconds(sleep_time));
+            }
+        }, &bot)};
+        sound_thread.detach();
+
+
         while(running)
         {
             if(!said_welcome_message)
@@ -926,16 +1240,17 @@ void start_bot(int args, const char** argc)
         }
     }
     curl_easy_cleanup(curl_handle);
+    SDL_Quit();
 }
 
 int main(int args, const char** argc)
 {
 
     // TODO
-    // settitle
-    // tts and tiktok api
     // follow notif
     // sub notif
+    // tts and tiktok api
+    // cheer notif
     // point system
     // social credit system
     // raid notif
