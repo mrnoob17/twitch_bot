@@ -1,13 +1,7 @@
 // c++ twitch bot
 #define SDL_MAIN_HANDLED
-#define ASIO_STANDALONE
-#define ASIO_HAS_THREADS
 #define CURL_STATICLIB
  
-#include "websocketpp/config/asio_client.hpp"
-
-#include "websocketpp/client.hpp"
-
 #include <SDL.h>
 #include <SDL_mixer.h>
 
@@ -17,6 +11,7 @@
 
 namespace Files = std::filesystem;
 
+#include "websocket.hpp"
 #include "curl_wrapper.hpp"
 #include "types.hpp"
 #include "utilities.hpp"
@@ -25,21 +20,18 @@ namespace Files = std::filesystem;
 
 CURL* curl_handle {nullptr};
 
-using Client = websocketpp::client<websocketpp::config::asio_tls_client>;
-using Connection_Handle = websocketpp::connection_hdl;
-using Connection_Pointer = Client::connection_ptr;
-
 const String broadcaster_badge {"broadcaster"};
 const String moderator_badge   {"moderator"};
 const String vip_badge         {"vip"};
 const String founder_badge     {"founder"};
 const String subscriber_badge  {"subscriber"};
 
-String CLIENT_ID        {};
-String BROADCASTER_ID   {};
-String AUTH_TOKEN       {};
-String YOUTUBE_API_KEY  {};
-String BROADCASTER_NAME {};
+String CLIENT_ID         {};
+String BROADCASTER_ID    {};
+String AUTH_TOKEN        {};
+String YOUTUBE_API_KEY   {};
+String BROADCASTER_NAME  {};
+String TIKTOK_SESSION_ID {};
 
 struct Parsed_Message
 {
@@ -48,6 +40,7 @@ struct Parsed_Message
     String message;
     String user_id;
     String badges;
+    bool reply;
 };
 
 String format_reply(const String& sender, const String& message)
@@ -65,7 +58,7 @@ String format_send(const String& message)
     return "PRIVMSG #" + BROADCASTER_NAME + " :" + message + "\r\n";
 }
 
-String tts_streamelements_text_format(const String& data)
+String tts_text_format(const String& data)
 {
     auto vec {tokenize(data)};
     String result;
@@ -124,6 +117,7 @@ Parsed_Message parse_message(const String& msg)
                 badge = msg.find("/", start);
             }
         }
+
         return result;
     }};
 
@@ -142,6 +136,7 @@ Parsed_Message parse_message(const String& msg)
     result.message = get_message();
     result.badges = get_badges();
     result.user_id = get_user_id();
+    result.reply = msg.find("reply") != String::npos;
 
     clean_line(&result.host);
     clean_line(&result.nick);
@@ -152,230 +147,29 @@ Parsed_Message parse_message(const String& msg)
     return result;
 }
 
-struct Connection_Metadata
+void twitch_irc_message_handler(Connection_Metadata* m, Client::message_ptr msg)
 {
-    using Pointer = websocketpp::lib::shared_ptr<Connection_Metadata>;
-    Connection_Metadata(const int _id, Connection_Handle _handle, const String& _uri) : id(_id), handle(_handle), uri(_uri)
-    {
-        status = "Connecting";
-        server = "N/A";
+    std::scoped_lock g {m->message_mutex};
+    auto pay_load {msg->get_payload()};
+    if(msg->get_opcode() == websocketpp::frame::opcode::text){
+        m->messages.push_back(pay_load);
     }
-
-    void on_open(Client* c, Connection_Handle handle)
-    {
-        status = "Open";
-        auto cptr {c->get_con_from_hdl(handle)}; 
-        server = cptr->get_response_header("Server");
-
-        if(irc_connector)
-        {
-            c->send(handle, "CAP REQ :twitch.tv/membership twitch.tv/tags twitch.tv/commands\r\n", websocketpp::frame::opcode::text);
-            c->send(handle, "PASS oauth:" + AUTH_TOKEN + "\r\n", websocketpp::frame::opcode::text);
-            c->send(handle, "NICK " + BROADCASTER_NAME + "\r\n", websocketpp::frame::opcode::text);
-            c->send(handle, "JOIN #" + BROADCASTER_NAME + "\r\n", websocketpp::frame::opcode::text);
-        }
+    else{
+        pay_load = websocketpp::utility::to_hex(pay_load);
     }
-    
-    void on_fail(Client* c, Connection_Handle handle)
-    {
-        status = "Failed";
-        auto cptr {c->get_con_from_hdl(handle)}; 
-        server = cptr->get_response_header("Server");
-        why_failed = cptr->get_ec().message();
-        printf("%s\n", why_failed.c_str());
-    }
+    printf("%s : %s\n", m->name.c_str(), pay_load.c_str());
+}
 
-    void on_close(Client * c, websocketpp::connection_hdl hdl) {
-        status = "Closed";
-        Client::connection_ptr con = c->get_con_from_hdl(hdl);
-        std::stringstream s;
-        s << "close code: " << con->get_remote_close_code() << " (" 
-          << websocketpp::close::status::get_string(con->get_remote_close_code()) 
-          << "), close reason: " << con->get_remote_close_reason();
-        why_failed = s.str();
-        printf("%s\n", why_failed.c_str());
-    }
-
-    void on_message(Connection_Handle, Client::message_ptr msg)
-    {
-        std::lock_guard<std::mutex> g {message_mutex};
-        auto pay_load {msg->get_payload()};
-        if(msg->get_opcode() == websocketpp::frame::opcode::text)
-        {
-            if(!irc_connector){
-                messages.push_back("<< " + pay_load);
-            }
-            if(pay_load.find("JOIN") != String::npos){
-                joined = true;
-            }
-            auto parsed_message {parse_message(pay_load)};
-            if(!parsed_message.message.empty()){
-                priv_messages.push_back(parsed_message);
-            }
-            else
-            {
-                auto tokens {tokenize(pay_load)};
-                if(!tokens.empty())
-                {
-                    if(tokens[0] == "PING"){
-                        ping_messages.push_back(pay_load);
-                    }
-                }
-            }
-        }
-        else
-        {
-            pay_load = websocketpp::utility::to_hex(pay_load);
-            if(!irc_connector){
-                messages.push_back("<< " + pay_load);
-            }
-        }
-        printf("%s : %s\n", name.c_str(), pay_load.c_str());
-    }
-    void record_sent_message(String message) {
-        //messages.push_back(">> " + message);
-    }
-
-    int id;
-    Connection_Handle handle;
-    String uri;
-    String status;
-    String server;
-    String name;
-    bool irc_connector;
-    std::mutex message_mutex;
-    Vector<String> messages;
-    Vector<Parsed_Message> priv_messages;
-    Vector<String> ping_messages;
-    String why_failed;
-    std::atomic<bool> joined {false};
-};
-
-struct Websocket_Endpoint
+void event_sub_message_handler(Connection_Metadata* m, Client::message_ptr msg)
 {
-    Websocket_Endpoint () : next_id(0)
-    {
-        end_point.clear_access_channels(websocketpp::log::alevel::all);
-        end_point.clear_error_channels(websocketpp::log::elevel::all);
-
-        end_point.init_asio();
-
-        end_point.set_tls_init_handler(websocketpp::lib::bind(on_tls_init));
-
-        end_point.start_perpetual();
-
-        thread = websocketpp::lib::make_shared<websocketpp::lib::thread>(&Client::run, &end_point);
+    std::scoped_lock g {m->message_mutex};
+    auto pay_load {msg->get_payload()};
+    if(msg->get_opcode() != websocketpp::frame::opcode::text){
+        pay_load = websocketpp::utility::to_hex(pay_load);
     }
-
-    using context_ptr = std::shared_ptr<asio::ssl::context>;
-
-	static context_ptr on_tls_init()
-	{
-		context_ptr ctx = std::make_shared<asio::ssl::context>(asio::ssl::context::sslv23);
-
-		try {
-			ctx->set_options(
-				asio::ssl::context::default_workarounds
-				| asio::ssl::context::no_sslv2
-				| asio::ssl::context::no_sslv3
-				| asio::ssl::context::single_dh_use
-			);
-
-		} catch (std::exception &e)
-		{
-			std::cout << "Error in context pointer: " << e.what() << std::endl;
-		}
-		return ctx;
-	}
-    int connect(String const & uri, const String& name, const bool irc_connector = true)
-    {
-        websocketpp::lib::error_code ec;
-
-        auto con {end_point.get_connection(uri, ec)};
-
-        if(ec)
-        {
-            std::cout << "> Connect initialization error: " << ec.message() << std::endl;
-            return -1;
-        }
-
-        auto new_id {next_id++};
-        auto metadata_ptr {websocketpp::lib::make_shared<Connection_Metadata>(new_id, con->get_handle(), uri)};
-        connection_list[new_id] = metadata_ptr;
-        metadata_ptr->name = name;
-        metadata_ptr->irc_connector = irc_connector;
-
-        con->set_open_handler(websocketpp::lib::bind(
-            &Connection_Metadata::on_open,
-            metadata_ptr,
-            &end_point,
-            websocketpp::lib::placeholders::_1
-        ));
-
-        con->set_fail_handler(websocketpp::lib::bind(
-            &Connection_Metadata::on_fail,
-            metadata_ptr,
-            &end_point,
-            websocketpp::lib::placeholders::_1
-        ));
-
-        con->set_close_handler(websocketpp::lib::bind(
-            &Connection_Metadata::on_close,
-            metadata_ptr,
-            &end_point,
-            websocketpp::lib::placeholders::_1
-        ));
-
-        con->set_message_handler(websocketpp::lib::bind(
-            &Connection_Metadata::on_message,
-            metadata_ptr,
-            websocketpp::lib::placeholders::_1,
-            websocketpp::lib::placeholders::_2
-        ));
-
-        end_point.connect(con);
-
-        return new_id;
-    }
-
-    void send(int id, String message)
-    {
-        websocketpp::lib::error_code ec;
-        
-        auto metadata_it {connection_list.find(id)};
-        if (metadata_it == connection_list.end()) {
-            std::cout << "> No connection found with id " << id << std::endl;
-            return;
-        }
-        
-        end_point.send(metadata_it->second->handle, message, websocketpp::frame::opcode::text, ec);
-        if (ec) {
-            std::cout << "> Error sending message: " << ec.message() << std::endl;
-            return;
-        }
-        
-        metadata_it->second->record_sent_message(message);
-    }
-
-    Connection_Metadata::Pointer get_metadata(int id) const
-    {
-        auto metadata_it {connection_list.find(id)};
-        if(metadata_it == connection_list.end()){
-            return Connection_Metadata::Pointer();
-        }
-        else{
-            return metadata_it->second;
-        }
-    }
-
-    using Connection_List = std::map<int, Connection_Metadata::Pointer>;
-    int next_id;
-    Connection_List connection_list;
-    Client end_point;
-    websocketpp::lib::shared_ptr<websocketpp::lib::thread> thread;
-};
-
-
+    m->messages.push_back("<< " + pay_load);
+    printf("%s : %s\n", m->name.c_str(), pay_load.c_str());
+}
 
 struct User
 {
@@ -388,9 +182,21 @@ struct User
 
 struct Bot
 {
+
+    struct Voice;
+    struct Sound_To_Play;
+
+    struct Sound_Effect
+    {
+        String name;
+        std::function<void(Sound_Effect*, Sound_To_Play*)> callback;
+        s16 angle {0};
+    };
+
     struct Music_Info
     {
         Youtube_Video_Info video;
+        String video_link;
         Vector<String> args;
     };
 
@@ -402,12 +208,39 @@ struct Bot
 
     struct Sound_To_Play
     {
+        Timer pause;
         bool played {false};
         int channel;
         Sound* sound {nullptr};
         Mix_Chunk* tts {nullptr};
         int loops {0};
         int volume {MIX_MAX_VOLUME / 4};
+        s64 tts_id {-1};
+
+        void play()
+        {
+            played = true;
+            if(sound){
+                channel = Mix_PlayChannel(-1, sound->chunk, loops);
+            }
+            else{
+                channel = Mix_PlayChannel(-1, tts, loops);
+            }
+            Mix_Volume(channel, volume);
+
+            for(auto& e : sound_effects){
+                e.callback(&e, this);
+            }
+        }
+        void clean_up()
+        {
+            if(tts){
+                Mix_FreeChunk(tts);
+            }
+            Mix_UnregisterAllEffects(channel);
+        }
+
+        Vector<Sound_Effect> sound_effects;
     };
 
     using Callback = void(*)(Bot*, const Vector<String>& args);
@@ -444,7 +277,7 @@ struct Bot
     void check_messages()
     {
         {
-            std::lock_guard<std::mutex> g {event_sub_handle->message_mutex};
+            std::scoped_lock g {event_sub_handle->message_mutex};
             if(!event_sub_handle->messages.empty())
             {
                 if(event_sub_session_id.empty())
@@ -481,8 +314,6 @@ struct Bot
                     auto s {json_get_value_naive("message_type", data)};
 
                     event_sub_handle->messages.erase(event_sub_handle->messages.begin());
-                    //twitch follow notif
-                    //Event Sub : {"metadata":{"message_id":"k1SWN3SGe2BeNYxkD_cjR4maZ99PDRDd6Zx48W9t5qw=","message_type":"notification","message_timestamp":"2023-08-25T16:21:23.993248783Z","subscription_type":"channel.follow","subscription_version":"2"},"payload":{"subscription":{"id":"0929c6e1-c008-4c2f-ab6c-8d236d46afde","status":"enabled","type":"channel.follow","version":"2","condition":{"broadcaster_user_id":"445242086","moderator_user_id":"445242086"},"transport":{"method":"websocket","session_id":"AgoQU9piiL9nShG3bjSWvTLfqBIGY2VsbC1i"},"created_at":"2023-08-25T13:01:47.909083114Z","cost":0},"event":{"user_id":"726187387","user_login":"555gerson555","user_name":"555gerson555","broadcaster_user_id":"445242086","broadcaster_user_login":"coffee_lava","broadcaster_user_name":"coffee_lava","followed_at":"2023-08-25T16:21:23.993240695Z"}}}
 
                     if(s == "notification")
                     {
@@ -504,7 +335,7 @@ struct Bot
                             if(!found)
                             {
                                 add_message(format_reply_2("Yo lil bro! Thanks for the follow!", s));
-                                message = tts_streamelements_text_format(s + " thanks for the follow lil bro!");
+                                message = tts_text_format(s + " thanks for the follow lil bro!");
                                 already_thanks_for_the_follow.push_back(user_login);
                                 std::ofstream file {already_followed, std::ios::app};
                                 file<<user_login<<'\n';
@@ -514,14 +345,14 @@ struct Bot
                         {
                             s = json_get_value_naive("user_name", data);
                             add_message(format_reply_2("Yo lil bro! Thanks for subbing!", s));
-                            message = tts_streamelements_text_format(s + " thanks for the subbing lil bro!");
+                            message = tts_text_format(s + " thanks for the subbing lil bro!");
                         }
                         if(!message.empty())
                         {
                             auto thank_you {tts_from_streamelements("Brian", message)};
                             if(thank_you.tts)
                             {
-                                std::lock_guard<std::mutex> g {sound_mutex};
+                                std::scoped_lock g {sound_mutex};
                                 sounds_to_play.push_back(thank_you);
                             }
                         }
@@ -529,10 +360,40 @@ struct Bot
                 }
             }
         } 
-        if(!handle->priv_messages.empty())
         {
-            const auto& sender {handle->priv_messages.front()};
-            auto tokens {tokenize(sender.message)};
+            std::scoped_lock g {handle->message_mutex};
+            for(auto& m : handle->messages)
+            {
+                if(m.find("JOIN") != String::npos){
+                    handle->joined = true;
+                }
+                else
+                {
+                    auto parsed_message {parse_message(m)};
+                    if(!parsed_message.message.empty()){
+                        priv_messages.push_back(parsed_message);
+                    }
+                    else
+                    {
+                        auto tokens {tokenize(m)};
+                        if(!tokens.empty())
+                        {
+                            if(tokens[0] == "PING"){
+                                ping_messages.push_back(m);
+                            }
+                        }
+                    }
+                }
+            }
+            handle->messages.clear();
+        }
+        if(!priv_messages.empty())
+        {
+            const auto& msg {priv_messages.front()};
+            auto tokens {tokenize(msg.message)};
+            if(msg.reply){
+                tokens.erase(tokens.begin());
+            }
             auto has_command {false};
             if(tokens[0][0] == '!')
             {
@@ -542,14 +403,14 @@ struct Bot
                     has_command = true;
                     bool badge_is_good {};
                     if(c->no_badges){
-                        badge_is_good = sender.badges.empty(); 
+                        badge_is_good = msg.badges.empty(); 
                     }
                     else
                     {
                         badge_is_good = c->badges.empty();
                         for(const auto& s : c->badges)
                         {
-                            if(sender.badges.find(s) != String::npos)
+                            if(msg.badges.find(s) != String::npos)
                             {
                                 badge_is_good = true;
                                 break;
@@ -559,15 +420,12 @@ struct Bot
                     if(badge_is_good)
                     {
                         tokens.erase(tokens.begin());
-                        tokens.insert(tokens.begin(), sender.nick);
-                        if(tokens.back() == "≤áÇÇ"){
-                            tokens.pop_back();
-                        }
+                        tokens.insert(tokens.begin(), msg.nick);
                         auto t {std::thread(c->callback, this, tokens)};
                         t.detach();
                     }
                     else{
-                        add_message(format_reply(sender.nick, "You are not BatChest enough!"));
+                        add_message(format_reply(msg.nick, "You are not BatChest enough!"));
                     }
                 }
             }
@@ -598,24 +456,24 @@ struct Bot
                     }
                 }
                 if(has_banned_word){
-                    ban_user(sender.user_id, duration);
+                    ban_user(msg.user_id, duration);
                 }
             }
-            handle->priv_messages.erase(handle->priv_messages.begin());
+            priv_messages.erase(priv_messages.begin());
         }
-        if(!handle->ping_messages.empty())
+        if(!ping_messages.empty())
         {
-            auto& pong {handle->ping_messages.front()};
+            auto& pong {ping_messages.front()};
             pong[1] = 'O';
             add_message(pong);
             printf("%s\n", pong.c_str());
-            handle->ping_messages.erase(handle->ping_messages.begin());
+            ping_messages.erase(ping_messages.begin());
         }
     }
 
     void check_music_queue()
     {
-        std::lock_guard<std::mutex> g {music_mutex};
+        std::scoped_lock g {music_mutex};
         if(!music_queue.empty())
         {
             const auto can_play {!music_playing()};
@@ -623,7 +481,7 @@ struct Bot
             {
                 const auto& music {music_queue.front()};
     
-                String str {"start /min mpv " + music.args[1] + " --no-video"};
+                String str {"start /min mpv " + music.video_link + " --no-video"};
     
                 auto result {system(str.c_str())};
                 if(result == 0)
@@ -644,35 +502,46 @@ struct Bot
 
     void check_sounds_to_play()
     {
-        std::lock_guard<std::mutex> g {sound_mutex};
+        std::scoped_lock g {sound_mutex};
         if(!sounds_to_play.empty())
         {
             auto& s {sounds_to_play.front()};
-            if(!s.played)
+            if(s.pause.wait > 0)
             {
-                s.played = true;
-                if(s.sound){
-                    s.channel = Mix_PlayChannel(-1, s.sound->chunk, s.loops);
+                if(!s.pause.started){
+                    s.pause.start();
                 }
-                else{
-                    s.channel = Mix_PlayChannel(-1, s.tts, s.loops);
+                else if(s.pause.is_time()){
+                    sounds_to_play.erase(sounds_to_play.begin());
                 }
-                Mix_Volume(s.channel, s.volume);
             }
             else
             {
-                if(!Mix_Playing(s.channel))
-                {
-                    if(s.tts){
-                        Mix_FreeChunk(s.tts);
-                    }
-                    sounds_to_play.erase(sounds_to_play.begin());
+                if(!s.played){
+                    s.play();
                 }
+                else
+                {
+                    if(!Mix_Playing(s.channel))
+                    {
+                        s.clean_up();
+                        sounds_to_play.erase(sounds_to_play.begin());
+                    }
+                }
+            }
+        }
+        if(!tts_sounds_to_play_elevated.empty())
+        {
+            auto& s {tts_sounds_to_play_elevated.front()};
+            if(!Mix_Playing(s.channel))
+            {
+                s.clean_up();
+                tts_sounds_to_play_elevated.erase(tts_sounds_to_play_elevated.begin());
             }
         }
     }
 
-    Sound* get_sound(const String s)
+    Sound* get_sound(const String& s)
     {
         for(auto& sound : sounds)
         {
@@ -683,9 +552,36 @@ struct Bot
         return nullptr;
     }
 
+    const Sound_Effect* get_sound_effect(const String& s)
+    {
+        for(auto& e : sound_effects)
+        {
+            if(e.name == s){
+                return &e;
+            }
+        }
+        return nullptr;
+    }
+
+    Sound_To_Play get_tts(const Voice* voice, const String& phrase)
+    {
+        if(!voice){
+            return tts_from_streamelements("brian", phrase);
+        }
+        else
+        {
+            if(voice->api == Voice::Stream_Elements){
+                return tts_from_streamelements(voice->name, phrase);
+            }
+            else{
+                return tts_from_tiktok(voice->code, phrase);
+            }
+        }
+    }
+
     Sound_To_Play tts_from_streamelements(String voice, const String& phrase)
     {
-        std::lock_guard<std::mutex> gg {curl_mutex};
+        std::scoped_lock gg {curl_mutex};
         curl_easy_reset(curl_handle);
         Sound_To_Play play;
         voice[0] = toupper(voice[0]);
@@ -701,15 +597,47 @@ struct Bot
         return play;
     };
 
-    bool has_voice(const String s)
+    Sound_To_Play tts_from_tiktok(String voice, const String& phrase)
+    {
+        std::scoped_lock gg {curl_mutex};
+        curl_easy_reset(curl_handle);
+        Sound_To_Play play;
+
+        auto list {set_curl_headers((String{"User-Agent"} + ":" + " com.zhiliaoapp.musically/2022600030 (Linux; U; Android 7.1.2; es_ES; SM-G988N; Build/NRD90M;tt-ok/3.12.13.1)").c_str(),
+                                     (String{"Cookie"} + ":" + " sessionid=" + TIKTOK_SESSION_ID).c_str(), 
+                                     (String{"Content-Length"} + ":" + "0").c_str())};
+
+        curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, list);
+        curl_easy_setopt(curl_handle, CURLOPT_CUSTOMREQUEST, "POST");
+
+        String url {"https://api22-normal-c-useast1a.tiktokv.com/media/api/text/speech/invoke/?text_speaker=" + voice + "&req_text=" + phrase + "&speaker_map_type=0&aid=1233"};
+
+        const String data {curl_call(url, curl_handle)};
+
+        auto b64 {json_get_value_naive("v_str", data)};
+
+        auto file {base64_decode(b64)};
+
+        auto rwops {SDL_RWFromConstMem((void*)file.data(), file.length())};
+        if(rwops)
+        {
+            play.tts = Mix_LoadWAV_RW(rwops, 0);
+            SDL_RWclose(rwops);
+        }
+
+        curl_slist_free_all(list);
+        return play;
+    };
+
+    Voice* has_voice(const String s)
     {
         for(auto& v : voices)
         {
-            if(v == s){
-                return true;
+            if(v.name == s){
+                return &v;
             }
         }
-        return false;
+        return nullptr;
     }
 
     bool music_playing()
@@ -723,7 +651,7 @@ struct Bot
 
     void send_messages()
     {
-        std::lock_guard<std::mutex> g {send_mutex};
+        std::scoped_lock g {send_mutex};
         for(const auto& s : messages_to_send){
             end_point.send(connection_id, s);
         }
@@ -732,13 +660,13 @@ struct Bot
 
     void add_message(const String& str)
     {
-        std::lock_guard<std::mutex> g {send_mutex};
+        std::scoped_lock g {send_mutex};
         messages_to_send.push_back(str);
     }
 
     void ban_user(const String& id, const int dur)
     {
-        std::lock_guard<std::mutex> guard {curl_mutex};
+        std::scoped_lock guard {curl_mutex};
         curl_easy_reset(curl_handle);
 
         String url {"https://api.twitch.tv/helix/moderation/bans?broadcaster_id=" + BROADCASTER_ID + "&moderator_id=" + BROADCASTER_ID}; 
@@ -772,7 +700,7 @@ struct Bot
 
     void subscribe_to_event(const String& s, const int v, const String& c)
     {
-        std::lock_guard<std::mutex> guard {curl_mutex};
+        std::scoped_lock guard {curl_mutex};
         curl_easy_reset(curl_handle);
 
         String url {"https://api.twitch.tv/helix/eventsub/subscriptions"}; 
@@ -835,17 +763,67 @@ struct Bot
         }
 
         {
+            printf("loading sounds\n");
             const String directory {"sounds/"};
-            sounds.reserve(100);
             String file_name;
+
+            Vector<Pair<String, String>> path_and_name;
+            path_and_name.reserve(200);
+
             for(const auto& e : Files::directory_iterator(directory))
             {
-                sounds.push_back({});
-                auto& s {sounds.back()};
-                s.name = e.path().filename().stem().string();
                 file_name = e.path().filename().string(); 
-                s.chunk = Mix_LoadWAV((directory + file_name).c_str());
+
+                path_and_name.push_back({directory + file_name, e.path().filename().stem().string()});
             }
+
+            sounds.resize(path_and_name.size());
+
+            auto sound_counter {0};
+            auto load_sound {[&](const Pair<String, String>* data, const int start, const int end)
+            {
+                for(int i = start; i < end; i++)
+                {
+                    const auto& d {data[i]};
+                    auto chunk {Mix_LoadWAV(d.first.c_str())};
+                    sound_counter++;
+                    auto& s {sounds[i]};
+                    s.name = d.second;
+                    s.chunk = chunk;
+                }
+            }};
+
+            const int data_to_handle {25};
+            auto number_of_threads {path_and_name.size() / data_to_handle};
+            const auto rem {path_and_name.size() % data_to_handle};
+
+            if(number_of_threads < 1){
+                number_of_threads = 1;
+            }
+            if(rem != 0){
+                number_of_threads++;
+            }
+
+            Vector<std::thread> threads(number_of_threads);
+            for(int i = 0; i < threads.size(); i++)
+            {
+                auto start {i * data_to_handle};
+
+                int end {start + data_to_handle};
+                if(end > path_and_name.size()){
+                    end = path_and_name.size();
+                }
+                threads[i] = std::thread(load_sound, path_and_name.data(), start, end);
+            }
+            for(auto& t : threads){
+                t.join();
+            }
+            if(sound_counter != path_and_name.size())
+            {
+                printf("big problem lil bro %i %llu\n", sound_counter, path_and_name.size());
+                assert(false);
+            }
+            printf("finished loading sounds\n");
         }
     
     }
@@ -865,6 +843,8 @@ struct Bot
         }
     }
 
+    s64 TTS_ID_COUNTER {0};
+
     bool experimental {false};
 
     int connection_id;
@@ -882,15 +862,35 @@ struct Bot
     String today;
     String event_sub_session_id;
 
-    Vector<String> voices;
+
+    struct Voice
+    {
+        enum API
+        {
+            Stream_Elements,
+            TikTok,
+        };
+        String name;
+        API api;
+        String code;
+    };
+
+    Vector<Voice> voices;
+
     Vector<Sound> sounds;
     Vector<Sound_To_Play> sounds_to_play;
+    Vector<Sound_To_Play> tts_sounds_to_play_elevated;
     Vector<String> already_thanks_for_the_follow;
+
+    Vector<Sound_Effect> sound_effects;
 
     Music_Info last_song;
     Vector<Music_Info> music_queue;
     Vector<Pair<String, int>> banned_words;
     Vector<User> current_users;
+
+    Vector<Parsed_Message> priv_messages;
+    Vector<String> ping_messages;
 
     String already_followed {"already_followed.txt"};
     String data_file_name   {"bot.txt"};
@@ -930,6 +930,11 @@ void game_callback(Bot* b, const Vector<String>& args)
    b->add_message(format_reply(args[0], "Steam : working on a roguelike called Morphus! https://store.steampowered.com/app/2371310/Morphus/"));
 }
 
+void demo_callback(Bot* b, const Vector<String>& args)
+{
+   b->add_message(format_reply(args[0], "Demo : Check out the demo here! https://store.steampowered.com/app/2371310/Morphus/"));
+}
+
 void editor_callback(Bot* b, const Vector<String>& args)
 {
    b->add_message(format_reply(args[0], "Editor : neovim baseg"));
@@ -967,8 +972,17 @@ void os_callback(Bot* b, const Vector<String>& args)
 
 void tts_callback(Bot* b, const Vector<String>& args)
 {
-    std::lock_guard<std::mutex> g {b->sound_mutex};
+    // TODO parser needs some work still
+    std::scoped_lock g {b->sound_mutex};
     String global_phrase {};
+
+    Bot::Voice* global_voice {nullptr};
+    const auto tts_id {b->TTS_ID_COUNTER};
+    const auto previous_size {b->sounds_to_play.size()};
+    b->TTS_ID_COUNTER++;
+
+    Vector<Bot::Sound_Effect> current_sound_effects;
+    auto last_global_token {0};
 
     for(int i = 1; i < args.size(); i++)
     {
@@ -976,105 +990,186 @@ void tts_callback(Bot* b, const Vector<String>& args)
 
         if(s[0] == '-' || s[0] == '+')
         {
-            Bot::Sound_To_Play play;
             auto pipe {s.find('|')};
             auto pipe2 {s.find('|', pipe + 1)};
-            auto stem {s.substr(1, pipe - 1)};
 
-            if(b->has_voice(stem))
+            String stem;
+
+            if(s.length() == 1)
             {
-                String phrase {};
-                int j;
-                for(j = i + 1; j < args.size(); j++)
-                {
-                    // TODO if valid sound or voice continue else keep adding to the phrase
-
-                    if(args[j][0] == '-' || args[j][0] == '+')
-                    {
-                        i = j - 1;
-                        break;
-                    }
-                    phrase += args[j];
-                    if(j != args.size() - 1){
-                        phrase += '+';
-                    }
+                if(s[0] == '-'){
+                    stem = "minus";
                 }
-                if(j == args.size()){
-                    i = j;
+                else{
+                    stem = "plus";
                 }
-                auto voice {stem};
-                voice[0] = toupper(voice[0]);
-                play = b->tts_from_streamelements(voice, phrase);
             }
             else
             {
-                auto sound {b->get_sound(stem)};
-                if(sound){
-                    play.sound = sound;
+                if(s.substr(0, 2) == "-p")
+                {
+                    if(s.length() > 2)
+                    {
+                        Bot::Sound_To_Play play;
+                        play.pause.wait = string_to_float(s.substr(2, String::npos));
+                        b->sounds_to_play.push_back(play);
+                    }
+                    continue;
                 }
                 else{
-                    global_phrase += stem + '+';
+                    stem = s.substr(1, pipe - 1);
                 }
             }
-            if(play.sound || play.tts)
+
+            auto se {b->get_sound_effect(stem)};
+            if(se)
             {
-                if(pipe != String::npos)
+                //if(!global_phrase.empty() && last_token_index < i){
+                //    current_sound_effects.clear();
+                //}
+                //current_sound_effects.push_back(*se);
+                //auto& see {current_sound_effects.back()};
+                //if(stem == "a")
+                //{
+                //    if(pipe != s.length() - 1){
+                //        see.angle = string_to_int(s.substr(pipe + 1, String::npos)); 
+                //    }
+                //}
+                //last_token_index = i;
+            }
+            else
+            {
+                Bot::Sound_To_Play play;
+
+                auto v {b->has_voice(stem)};
+                if(v)
                 {
-                    float f;
-                    if(pipe2 == String::npos){
-                        f = string_to_float(s.substr(pipe + 1, String::npos));
+                    String phrase {};
+                    int j;
+                    for(j = i + 1; j < args.size(); j++)
+                    {
+                        // TODO if valid sound or voice continue else keep adding to the phrase
+
+                        if(args[j][0] == '-' || args[j][0] == '+')
+                        {
+                            i = j - 1;
+                            break;
+                        }
+                        phrase += args[j];
+                        if(j != args.size() - 1){
+                            phrase += '+';
+                        }
                     }
-                    else{
-                        f = string_to_float(s.substr(pipe + 1, pipe2 - pipe));
+                    if(j == args.size()){
+                        i = j;
                     }
-                    play.volume = (float)play.volume * f;
-                }
-                if(pipe2 != String::npos)
-                {
-                    play.loops = string_to_int(s.substr(pipe2 + 1, String::npos));
-                    if(play.loops > 5){
-                        play.loops = 5;
+                    current_sound_effects.clear();
+                    play = b->get_tts(v, phrase);
+                    if(last_global_token > i){
+                        global_voice = v;
                     }
-                    if(play.loops < 0){
-                        play.loops = 0;
-                    }
-                }
-                if(s[0] == '-'){
-                    b->sounds_to_play.push_back(play);
                 }
                 else
                 {
-                    play.loops = 0;
-                    play.channel = Mix_PlayChannel(-1, play.sound->chunk, play.loops);
-                    Mix_Volume(play.channel, play.volume);
+                    auto sound {b->get_sound(stem)};
+                    if(sound){
+                        play.sound = sound;
+                    }
+                    else{
+                        global_phrase += stem + '+';
+                    }
+                }
+                if(play.sound || play.tts)
+                {
+                    // TODO
+                    if(!global_phrase.empty())
+                    {
+                        global_phrase.pop_back();
+                        auto tts {b->get_tts(global_voice, global_phrase)};
+                        if(tts.tts)
+                        {
+                            tts.sound_effects = current_sound_effects;
+                            b->sounds_to_play.push_back(tts);
+                        }
+                        global_phrase.clear();
+                    }
+                    play.sound_effects = current_sound_effects;
+                    if(play.sound){
+                        current_sound_effects.clear();
+                    }
+                    if(pipe != String::npos)
+                    {
+                        float f;
+                        if(pipe2 == String::npos){
+                            f = string_to_float(s.substr(pipe + 1, String::npos));
+                        }
+                        else{
+                            f = string_to_float(s.substr(pipe + 1, pipe2 - pipe));
+                        }
+                        play.volume = (float)play.volume * f;
+                    }
+                    if(pipe2 != String::npos && pipe2 != s.size() - 1)
+                    {
+                        play.loops = string_to_int(s.substr(pipe2 + 1, String::npos));
+                        if(play.loops > 5){
+                            play.loops = 5;
+                        }
+                        else if(play.loops < 0){
+                            play.loops = 0;
+                        }
+                    }
+                    if(s[0] == '-'){
+                        b->sounds_to_play.push_back(play);
+                    }
+                    else
+                    {
+                        play.loops = 0;
+                        play.play();
+                        b->tts_sounds_to_play_elevated.push_back(play);
+                    }
                 }
             }
         }
-        else{
+        else
+        {
             global_phrase += s + '+';
+            last_global_token = i;
         }
     }
     if(!global_phrase.empty())
     {
         global_phrase.pop_back();
-        auto tts {b->tts_from_streamelements("Brian", global_phrase)};
-        if(tts.tts){
+        auto tts {b->get_tts(global_voice, global_phrase)};
+        if(tts.tts)
+        {
+            tts.sound_effects = current_sound_effects;
             b->sounds_to_play.push_back(tts);
         }
+    }
+    for(int i = previous_size; i < b->sounds_to_play.size(); i++){
+        b->sounds_to_play[i].tts_id = tts_id;
     }
 }
 
 void music_callback(Bot* b, const Vector<String>& args)
 {
+    auto video_link {args[1]};
+    std::scoped_lock guard {b->curl_mutex};
 
-    std::lock_guard<std::mutex> guard {b->curl_mutex};
-    auto equals {args[1].find('=')};
+    {
+        auto list {video_link.find("&list")};
+        if(list != String::npos){
+            video_link.erase(list, String::npos);
+        }
+    }
+
+    auto equals {video_link.find('=')};
     if(equals == String::npos){
         b->add_message(format_reply(args[0], "AwkwardMonkey invalid video"));
         return;
     }
 
-    auto video       {args[1].substr(equals + 1, String::npos)}; 
+    auto video       {video_link.substr(equals + 1, String::npos)}; 
     String video_arg {"&id=" + video};
     String key_arg   {"&key=" + YOUTUBE_API_KEY};
     String api       {"https://www.googleapis.com/youtube/v3/videos?"};
@@ -1088,7 +1183,7 @@ void music_callback(Bot* b, const Vector<String>& args)
 
     if(yt_video.duration > 600)
     {
-        b->add_message(format_reply(args[0], "AwkwardMonkey video too long"));
+        b->add_message(format_reply(args[0], "AwkwardMonkey video too long max is 600 secs"));
         return;
     }
     else if(yt_video.title.empty())
@@ -1098,19 +1193,19 @@ void music_callback(Bot* b, const Vector<String>& args)
     }
     else if(yt_video.like_count < 1000)
     {
-        b->add_message(format_reply(args[0], "Susge video kinda sus"));
+        b->add_message(format_reply(args[0], "Susge video like count must be >= 1000"));
         return;
     }
     else if(yt_video.view_count < 1000)
     {
-        b->add_message(format_reply(args[0], "Susge video kinda sus"));
+        b->add_message(format_reply(args[0], "Susge video view count must be >= 1000"));
         return;
     }
 
     b->add_message(format_reply(args[0], "FeelsOkayMan song added to the queue"));
-    std::lock_guard<std::mutex> g {b->music_mutex};
+    std::scoped_lock g {b->music_mutex};
 
-    b->music_queue.push_back({yt_video, args});
+    b->music_queue.push_back({yt_video, video_link, args});
 }
 
 void skip_song_callback(Bot* b, const Vector<String>& args)
@@ -1133,21 +1228,24 @@ void skip_song_callback(Bot* b, const Vector<String>& args)
 
 void skip_sound_callback(Bot* b, const Vector<String>& args)
 {
-    std::lock_guard<std::mutex> g {b->sound_mutex};
+    std::scoped_lock g {b->sound_mutex};
     if(!b->sounds_to_play.empty())
     {
-        auto& s {b->sounds_to_play.front()};
-        if(s.played)
+        const auto id {b->sounds_to_play.front().tts_id};
+        while(b->sounds_to_play.front().tts_id == id)
         {
-            Mix_HaltChannel(s.channel);
+            Mix_HaltChannel(b->sounds_to_play.front().channel);
             b->sounds_to_play.erase(b->sounds_to_play.begin());
+            if(b->sounds_to_play.empty()){
+                break;
+            }
         }
     }
 }
 
 void music_count_callback(Bot* b, const Vector<String>& args)
 {
-    std::lock_guard<std::mutex> g {b->music_mutex};
+    std::scoped_lock g {b->music_mutex};
     b->add_message(format_reply(args[0], std::to_string(b->music_queue.size()) + " song(s) in the queue"));
 }
 
@@ -1185,7 +1283,7 @@ void set_today_callback(Bot* b, const Vector<String>& args)
 
 void set_title_callback(Bot* b, const Vector<String>& args)
 {
-    std::lock_guard<std::mutex> guard {b->curl_mutex};
+    std::scoped_lock guard {b->curl_mutex};
     curl_easy_reset(curl_handle);
 
     String url {"https://api.twitch.tv/helix/channels?broadcaster_id=" + BROADCASTER_ID}; 
@@ -1242,6 +1340,7 @@ void start_bot(Bot* _bot, int args, const char** argc)
         file>>CLIENT_ID;
         file>>AUTH_TOKEN;
         file>>YOUTUBE_API_KEY;
+        file>>TIKTOK_SESSION_ID;
     }
 
     {
@@ -1255,25 +1354,63 @@ void start_bot(Bot* _bot, int args, const char** argc)
     }
 
 
-    bot.experimental = true;
+    bot.experimental = false;
     bot.serialize_in();
 
-    bot.voices = {"brian",
-                  "filiz",
-                  "astrid",
-                  "tatyana",
-                  "maxim",
-                  "carmen",
-                  "ines",
-                  "cristiano",
-                  "vitoria",
-                  "ricardo"};
+    bot.voices = {{"brian", Bot::Voice::Stream_Elements},
+                  {"filiz", Bot::Voice::Stream_Elements},
+                  {"astrid", Bot::Voice::Stream_Elements},
+                  {"tatyana", Bot::Voice::Stream_Elements},
+                  {"maxim", Bot::Voice::Stream_Elements},
+                  {"carmen", Bot::Voice::Stream_Elements},
+                  {"ines", Bot::Voice::Stream_Elements},
+                  {"cristiano", Bot::Voice::Stream_Elements},
+                  {"vitoria", Bot::Voice::Stream_Elements},
+                  {"ricardo", Bot::Voice::Stream_Elements},
+                  {"jp", Bot::Voice::TikTok, "jp_005"},
+                  {"mjp", Bot::Voice::TikTok, "jp_006"},
+                  {"stitch", Bot::Voice::TikTok, "en_us_stitch"},
+                  {"rocket", Bot::Voice::TikTok, "en_us_rocket"},
+                  {"cp", Bot::Voice::TikTok, "en_us_c3po"},
+                  {"pirate", Bot::Voice::TikTok, "en_male_pirate"},
+                  {"de", Bot::Voice::TikTok, "de_001"},
+                  {"chip", Bot::Voice::TikTok, "en_male_m2_xhxs_m03_silly"},
+                  {"betty", Bot::Voice::TikTok, "en_female_betty"},
+                  {"granny", Bot::Voice::TikTok, "en_female_grandma"},
+                  {"soy", Bot::Voice::TikTok, "en_male_ukneighbor"},
+                  {"butler", Bot::Voice::TikTok, "en_male_ukbutler"},
+                  {"mde", Bot::Voice::TikTok, "de_002"},
+                  {"es", Bot::Voice::TikTok, "es_femalte_f6"},
+                  {"mes", Bot::Voice::TikTok, "es_002"},
+                  {"br", Bot::Voice::TikTok, "br_001"},
+                  {"mbr", Bot::Voice::TikTok, "br_005"},
+                  {"au", Bot::Voice::TikTok, "en_au_001"},
+                  {"mau", Bot::Voice::TikTok, "en_au_002"},
+                  {"us", Bot::Voice::TikTok, "en_us_001"},
+                  {"mus", Bot::Voice::TikTok, "en_us_006"},
+                  {"fr", Bot::Voice::TikTok, "fr_001"},
+                  {"sing", Bot::Voice::TikTok, "en_female_f08_salut_damour"},
+                  {"sing2", Bot::Voice::TikTok, "en_male_m03_lobby"},
+                  {"sing3", Bot::Voice::TikTok, "en_female_f08_warmy_breeze"},
+                  {"sing4", Bot::Voice::TikTok, "en_male_m03_sunshine_soon"},
+                  {"nar", Bot::Voice::TikTok, "en_male_narration"},
+                  {"fun", Bot::Voice::TikTok, "en_male_funny"},
+                  {"emo", Bot::Voice::TikTok, "en_female_emotional"}};
+
+    //bot.sound_effects.push_back({"r", [](Bot::Sound_Effect*, Bot::Sound_To_Play* s){
+    //    Mix_SetReverseStereo(s->channel, 1);
+    //}});
+
+    //bot.sound_effects.push_back({"a", [](Bot::Sound_Effect* e, Bot::Sound_To_Play* s){
+    //    Mix_SetPosition(s->channel, e->angle, 0);
+    //}});
 
     bot.add_command("commands", commands_callback); 
     bot.add_command("stack", stack_callback); 
     bot.add_command("drop", drop_callback); 
     bot.add_command("discord", discord_callback); 
     bot.add_command("game", game_callback); 
+    bot.add_command("demo", demo_callback); 
     bot.add_command("editor", editor_callback); 
     bot.add_command("engine", engine_callback); 
     bot.add_command("font", font_callback); 
@@ -1297,8 +1434,8 @@ void start_bot(Bot* _bot, int args, const char** argc)
     bot.add_command("sub", sub_callback, {subscriber_badge}); 
     bot.add_command("pleb", pleb_callback, {}, true); 
 
-    bot.connection_id = bot.end_point.connect("wss://irc-ws.chat.twitch.tv:443", "Twitch API");
-    bot.event_sub_connection_id = bot.end_point.connect("wss://eventsub.wss.twitch.tv/ws", "Event Sub", false);
+    bot.connection_id = bot.end_point.connect("wss://irc-ws.chat.twitch.tv:443", "Twitch IRC", twitch_irc_message_handler);
+    bot.event_sub_connection_id = bot.end_point.connect("wss://eventsub.wss.twitch.tv/ws", "Event Sub", event_sub_message_handler);
 
     printf("%i\n", bot.connection_id);
     printf("%i\n", bot.event_sub_connection_id);
@@ -1308,6 +1445,17 @@ void start_bot(Bot* _bot, int args, const char** argc)
     else
     {
         bot.handle = bot.end_point.connection_list[bot.connection_id];
+
+        {
+            std::unique_lock l {bot.handle->opened_mutex};
+            std::condition_variable cv;
+            bot.handle->opened_condition_variable.wait(l, [&]() {return bot.handle->opened;});
+        }
+
+        bot.end_point.send(bot.connection_id, "CAP REQ :twitch.tv/membership twitch.tv/tags twitch.tv/commands\r\n");
+        bot.end_point.send(bot.connection_id, "PASS oauth:" + AUTH_TOKEN + "\r\n");
+        bot.end_point.send(bot.connection_id, "NICK " + BROADCASTER_NAME + "\r\n");
+        bot.end_point.send(bot.connection_id, "JOIN #" + BROADCASTER_NAME + "\r\n");
 
         bot.event_sub_handle = bot.end_point.connection_list[bot.event_sub_connection_id];
 
@@ -1392,9 +1540,7 @@ int main(int args, const char** argc)
     }
 
     // TODO
-    // follow notif
-    // sub notif
-    // tts and tiktok api
+    // obs websocket api
     // cheer notif
     // point system
     // social credit system

@@ -13,6 +13,11 @@ struct Timer
         started = true;
         begin = Clock::now();
     }
+    void start()
+    {
+        started = true;
+        begin = Clock::now();
+    }
 
     void stop()
     {
@@ -141,4 +146,45 @@ inline float string_to_float(const String& s)
     ss>>res;
     return res;
 }
+
+inline String base64_decode(const String& b64)
+{
+    static constexpr const u8 fromBase64[] =
+    {
+        255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+        255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+        255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,  62, 255,  62, 255,  63,
+         52,  53,  54,  55,  56,  57,  58,  59,  60,  61, 255, 255,   0, 255, 255, 255,
+        255,   0,   1,   2,   3,   4,   5,   6,   7,   8,   9,  10,  11,  12,  13,  14,
+         15,  16,  17,  18,  19,  20,  21,  22,  23,  24,  25, 255, 255, 255, 255,  63,
+        255,  26,  27,  28,  29,  30,  31,  32,  33,  34,  35,  36,  37,  38,  39,  40,
+         41,  42,  43,  44,  45,  46,  47,  48,  49,  50,  51, 255, 255, 255, 255, 255
+    };
+ 
+
+    char* dest {new char [( 3 *  b64.length() / 4 )]};
+    char* start {dest};
+
+    for ( u64 i = 0; i < b64.length(); i += 4 )
+    {
+        u8 byte0 = (b64[i] <= 'z') ? fromBase64[b64[i]] : 0xff;
+        u8 byte1 = (b64[i + 1] <= 'z') ? fromBase64[b64[i + 1]] : 0xff;
+        u8 byte2 = (b64[i + 2] <= 'z') ? fromBase64[b64[i + 2]] : 0xff;
+        u8 byte3 = (b64[i + 3] <= 'z') ? fromBase64[b64[i + 3]] : 0xff;
+ 
+        if (byte1 != 0xff)
+            *dest++ = static_cast<u8>(((byte0 & 0x3f ) << 2) + ((byte1 & 0x30) >> 4));
+ 
+        if ( byte2 != 0xff )
+            *dest++ = static_cast<u8>(((byte1 & 0x0f ) << 4) + ((byte2 & 0x3c) >> 2));
+ 
+        if ( byte3 != 0xff )
+            *dest++ = static_cast<u8>(((byte2 & 0x03 ) << 6) + ((byte3 & 0x3f) >> 0));
+    }
+    String result {start, start + (dest - start)};
+    delete[] start;
+    return result;
+}
+
+
 
