@@ -87,11 +87,16 @@ Parsed_Message parse_message(const String& msg)
         return msg.substr(colon, msg.find("!", colon + 1) - colon);
     }};
 
-    auto get_message {[&]()
+    auto get_message_start {[&]()
     {
         auto fc {msg.find(" :")};
         auto colon {msg.find(" :", fc + 2)};
-        return msg.substr(colon + 2, msg.npos);
+        return colon + 2;
+    }};
+
+    auto get_message {[&]()
+    {
+        return msg.substr(get_message_start(), msg.npos);
     }};
 
     auto get_badges {[&]()
@@ -136,7 +141,10 @@ Parsed_Message parse_message(const String& msg)
     result.message = get_message();
     result.badges = get_badges();
     result.user_id = get_user_id();
-    result.reply = msg.find("reply") != String::npos;
+    {
+        auto r {msg.find("reply")};
+        result.reply = r != String::npos && r < get_message_start();
+    }
 
     clean_line(&result.host);
     clean_line(&result.nick);
@@ -391,7 +399,10 @@ struct Bot
         {
             const auto& msg {priv_messages.front()};
             auto tokens {tokenize(msg.message)};
-            if(msg.reply){
+            String to_who;
+            if(msg.reply)
+            {
+                to_who = tokens.front();
                 tokens.erase(tokens.begin());
             }
             auto has_command {false};
@@ -421,6 +432,9 @@ struct Bot
                     {
                         tokens.erase(tokens.begin());
                         tokens.insert(tokens.begin(), msg.nick);
+                        if(c->name == "tts" && !to_who.empty()){
+                            tokens.insert(tokens.begin(), to_who);
+                        }
                         auto t {std::thread(c->callback, this, tokens)};
                         t.detach();
                     }
