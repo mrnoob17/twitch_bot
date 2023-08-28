@@ -1462,7 +1462,6 @@ void start_bot(Bot* _bot, int args, const char** argc)
 
         {
             std::unique_lock l {bot.handle->opened_mutex};
-            std::condition_variable cv;
             bot.handle->opened_condition_variable.wait(l, [&]{
                 return bot.handle->opened;
             });
