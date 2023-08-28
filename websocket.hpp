@@ -89,25 +89,25 @@ struct Connection_Metadata
 struct Websocket_Endpoint
 {
     using Asio_Context = std::shared_ptr<asio::ssl::context>;
-	static Asio_Context on_tls_init()
-	{
+    static Asio_Context on_tls_init()
+    {
         Asio_Context ctx {std::make_shared<asio::ssl::context>(asio::ssl::context::sslv23)};
-
-		try
+    
+        try
         {
-			ctx->set_options(
-				asio::ssl::context::default_workarounds
-				| asio::ssl::context::no_sslv2
-				| asio::ssl::context::no_sslv3
-				| asio::ssl::context::single_dh_use
-			);
-
-		}
+        	ctx->set_options(
+        		asio::ssl::context::default_workarounds
+        		| asio::ssl::context::no_sslv2
+        		| asio::ssl::context::no_sslv3
+        		| asio::ssl::context::single_dh_use
+        	);
+        
+        }
         catch (std::exception &e){
-			printf("Error in context pointer: %s\n", e.what());
-		}
-		return ctx;
-	}
+        	printf("Error in context pointer: %s\n", e.what());
+        }
+        return ctx;
+    }
 
     Websocket_Endpoint () : next_id(0)
     {
