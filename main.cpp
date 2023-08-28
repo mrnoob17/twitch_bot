@@ -863,8 +863,8 @@ struct Bot
 
     int connection_id;
     int event_sub_connection_id;
-    Connection_Metadata::Pointer handle;
-    Connection_Metadata::Pointer event_sub_handle;
+    Connection_Metadata* handle;
+    Connection_Metadata* event_sub_handle;
     Websocket_Endpoint end_point;
     Stamp last_music_stamp;
     std::thread music_thread;
@@ -1458,12 +1458,14 @@ void start_bot(Bot* _bot, int args, const char** argc)
     }
     else
     {
-        bot.handle = bot.end_point.connection_list[bot.connection_id];
+        bot.handle = bot.end_point.get_metadata(bot.connection_id);
 
         {
             std::unique_lock l {bot.handle->opened_mutex};
             std::condition_variable cv;
-            bot.handle->opened_condition_variable.wait(l, [&]() {return bot.handle->opened;});
+            bot.handle->opened_condition_variable.wait(l, [&]{
+                return bot.handle->opened;
+            });
         }
 
         bot.end_point.send(bot.connection_id, "CAP REQ :twitch.tv/membership twitch.tv/tags twitch.tv/commands\r\n");
@@ -1471,23 +1473,13 @@ void start_bot(Bot* _bot, int args, const char** argc)
         bot.end_point.send(bot.connection_id, "NICK " + BROADCASTER_NAME + "\r\n");
         bot.end_point.send(bot.connection_id, "JOIN #" + BROADCASTER_NAME + "\r\n");
 
-        bot.event_sub_handle = bot.end_point.connection_list[bot.event_sub_connection_id];
+        bot.event_sub_handle = bot.end_point.get_metadata(bot.event_sub_connection_id);
 
         auto running {true};
         std::atomic<bool> said_welcome_message {false};
 
         const auto sleep_time {100};
 
-        //auto spawn_daemon_thread {[&]<typename U>(U u)
-        //{
-        //    auto t {std::thread([&](U f, Bot* b){
-        //        f();
-        //        std::this_thread::sleep_for(std::chrono::milliseconds(sleep_time));
-        //    })};
-        //    t.detach();
-        //}};
-        //spawn_daemon_thread();
-        
         auto message_thread {std::thread([&](Bot* b)
         {
             while(true)
