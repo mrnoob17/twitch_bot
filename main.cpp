@@ -630,7 +630,7 @@ struct Bot
 
         auto b64 {json_get_value_naive("v_str", data)};
 
-        auto file {base64_decode(b64)};
+        auto file {websocketpp::base64_decode(b64)};
 
         auto rwops {SDL_RWFromConstMem((void*)file.data(), file.length())};
         if(rwops)

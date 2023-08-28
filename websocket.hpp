@@ -1,5 +1,6 @@
 #pragma once
 
+#define _WEBSOCKETPP_CPP11_MEMORY_
 #define ASIO_STANDALONE
 #define ASIO_HAS_THREADS
 
@@ -177,14 +178,16 @@ struct Websocket_Endpoint
     {
         websocketpp::lib::error_code ec;
         
-        auto metadata_it {connection_list.find(id)};
-        if (metadata_it == connection_list.end()) {
+        auto metadata {connection_list[id]};
+        if(!metadata)
+        {
             printf("> No connection found with id : %i\n", id);
             return;
         }
         
-        end_point.send(metadata_it->second->handle, message, websocketpp::frame::opcode::text, ec);
-        if (ec) {
+        end_point.send(metadata->handle, message, websocketpp::frame::opcode::text, ec);
+        if(ec)
+        {
             printf("> Error sending message: %s\n", ec.message().c_str());
             return;
         }
