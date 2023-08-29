@@ -433,7 +433,7 @@ struct Bot
                         tokens.erase(tokens.begin());
                         tokens.insert(tokens.begin(), msg.nick);
                         if(c->name == "tts" && !to_who.empty()){
-                            tokens.insert(tokens.begin(), to_who);
+                            tokens.insert(tokens.begin() + 1, to_who);
                         }
                         auto t {std::thread(c->callback, this, tokens)};
                         t.detach();

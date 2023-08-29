@@ -48,7 +48,7 @@ struct Connection_Metadata
         printf("%s\n", reason.c_str());
     }
 
-    void on_close(Client * c, websocketpp::connection_hdl hdl) {
+    void on_close(Client* c, websocketpp::connection_hdl hdl) {
 
         status = "Closed";
         auto con {c->get_con_from_hdl(hdl)};
@@ -123,7 +123,7 @@ struct Websocket_Endpoint
         thread = websocketpp::lib::make_shared<websocketpp::lib::thread>(&Client::run, &end_point);
     }
 
-    int connect(String const & uri, const String& name, Connection_Metadata::On_Message_Handler omh)
+    int connect(const String& uri, const String& name, Connection_Metadata::On_Message_Handler omh)
     {
         websocketpp::lib::error_code ec;
 
@@ -174,7 +174,7 @@ struct Websocket_Endpoint
         return new_id;
     }
 
-    void send(int id, String message)
+    void send(const int id, const String& message)
     {
         websocketpp::lib::error_code ec;
         
@@ -198,9 +198,10 @@ struct Websocket_Endpoint
         return connection_list[id];
     }
 
-    using Connection_List = std::map<int, Connection_Metadata*>;
-    int next_id;
-    Connection_List connection_list;
-    Client end_point;
-    websocketpp::lib::shared_ptr<websocketpp::lib::thread> thread;
+    private:
+        using Connection_List = std::map<int, Connection_Metadata*>;
+        int next_id;
+        Connection_List connection_list;
+        Client end_point;
+        websocketpp::lib::shared_ptr<websocketpp::lib::thread> thread;
 };
