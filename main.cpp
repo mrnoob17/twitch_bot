@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <fstream>
 #include <filesystem>
+#include <random>
 
 namespace Files = std::filesystem;
 
@@ -19,6 +20,8 @@ namespace Files = std::filesystem;
 #include "json.hpp"
 
 CURL* curl_handle {nullptr};
+
+std::knuth_b GENERATOR;
 
 const String broadcaster_badge {"broadcaster"};
 const String moderator_badge   {"moderator"};
@@ -42,6 +45,12 @@ struct Parsed_Message
     String badges;
     bool reply;
 };
+
+bool roll_dice(const int n)
+{
+    std::uniform_int_distribution dis{1, 100};
+    return dis(GENERATOR) <= n;
+}
 
 String format_reply(const String& sender, const String& message)
 {
@@ -181,11 +190,44 @@ void event_sub_message_handler(Connection_Metadata* m, Client::message_ptr msg)
 
 struct User
 {
-    String nick;
-    String host;
-    String login_name;
-    String user_id;
-    String badges;
+    String user_id    {""};
+    String user_login {""};
+
+    String last_known_nick {};
+    String last_known_badges;
+
+    s64 points        {0}; 
+    s64 gamba_points  {0};
+    s64 social_credit {0};
+
+    bool stronger(const User& b)
+    {
+        if(!last_known_badges.empty() && b.last_known_badges.empty()){
+            return true;
+        }
+        if(last_known_badges.find(broadcaster_badge) != String::npos){
+            return true;
+        }
+        if(last_known_badges.find(moderator_badge) != String::npos && b.last_known_badges.find(moderator_badge) == String::npos){
+            return true;
+        }
+        if(last_known_badges.find(vip_badge) != String::npos && b.last_known_badges.find(vip_badge) == String::npos){
+            return true;
+        }
+        if(last_known_badges.find(subscriber_badge) != String::npos && b.last_known_badges.find(subscriber_badge) == String::npos){
+            return true;
+        }
+        return false;
+    }
+
+    void serialize_out(std::ostream* data)
+    {
+        auto& i {*data};
+        i<<"User : " <<user_id<<"\n\n";
+        i<<"\tPoints : " <<points<<"\n\n";
+        i<<"\tGamba_Points : " <<gamba_points<<"\n\n";
+        i<<"\tSocial_Credit : " <<social_credit<<"\n\n";
+    }
 };
 
 struct Bot
@@ -251,7 +293,7 @@ struct Bot
         Vector<Sound_Effect> sound_effects;
     };
 
-    using Callback = void(*)(Bot*, const Vector<String>& args);
+    using Callback = void(*)(Bot*, const String& user_id, const Vector<String>& args);
 
     struct Command
     {
@@ -284,6 +326,7 @@ struct Bot
 
     void check_messages()
     {
+        std::scoped_lock g {generic_mutex};
         {
             std::scoped_lock g {event_sub_handle->message_mutex};
             if(!event_sub_handle->messages.empty())
@@ -330,11 +373,11 @@ struct Bot
                         if(s == "channel.follow")
                         {
                             s = json_get_value_naive("user_name", data);
-                            auto user_login {json_get_value_naive("user_login", data)};
+                            auto user_id {json_get_value_naive("user_id", data)};
                             auto found {false};
                             for(auto& u : already_thanks_for_the_follow)
                             {
-                                if(u == user_login)
+                                if(u == user_id)
                                 {
                                     found = true;
                                     break;
@@ -342,11 +385,22 @@ struct Bot
                             }
                             if(!found)
                             {
+                                for(auto& u : users)
+                                {
+                                    if(u.user_id == user_id)
+                                    {
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if(!found)
+                            {
                                 add_message(format_reply_2("Yo lil bro! Thanks for the follow!", s));
                                 message = tts_text_format(s + " thanks for the follow lil bro!");
-                                already_thanks_for_the_follow.push_back(user_login);
-                                std::ofstream file {already_followed, std::ios::app};
-                                file<<user_login<<'\n';
+
+                                already_thanks_for_the_follow.push_back(user_id);
+                                users.push_back({user_id});
                             }
                         }
                         else if(s == "channel.subscribe" || s == "channel.subscription.message")
@@ -405,6 +459,14 @@ struct Bot
                 to_who = tokens.front();
                 tokens.erase(tokens.begin());
             }
+            {
+                auto u {get_user(msg.user_id)};
+                if(u)
+                {
+                    u->last_known_badges = msg.badges;
+                    u->last_known_nick = msg.nick;
+                }
+            }
             auto has_command {false};
             if(tokens[0][0] == '!')
             {
@@ -435,7 +497,7 @@ struct Bot
                         if(c->name == "tts" && !to_who.empty()){
                             tokens.insert(tokens.begin() + 1, to_who);
                         }
-                        auto t {std::thread(c->callback, this, tokens)};
+                        auto t {std::thread(c->callback, this, msg.user_id, tokens)};
                         t.detach();
                     }
                     else{
@@ -448,9 +510,6 @@ struct Bot
                 String str;
                 for(const auto& s : tokens)
                 {
-                    //if(s == "BatChest"){
-                    //    batchest_count++;
-                    //}
                     str += s;
                     str += ' ';
                 }
@@ -471,6 +530,12 @@ struct Bot
                 }
                 if(has_banned_word){
                     ban_user(msg.user_id, duration);
+                }
+            }
+            for(const auto& s : tokens)
+            {
+                if(s == "BatChest"){
+                    batchest_count++;
                 }
             }
             priv_messages.erase(priv_messages.begin());
@@ -678,6 +743,30 @@ struct Bot
         messages_to_send.push_back(str);
     }
 
+    User* get_user(const String& id)
+    {
+        for(auto& u : users)
+        {
+            if(u.user_id == id){
+                return &u;
+            }
+        }
+        return nullptr;
+    }
+    User* get_user_by_nick(const String& nick)
+    {
+        if(nick.empty()){
+            return nullptr;
+        }
+        for(auto& u : users)
+        {
+            if(u.last_known_nick == nick){
+                return &u;
+            }
+        }
+        return nullptr;
+    }
+
     void ban_user(const String& id, const int dur)
     {
         std::scoped_lock guard {curl_mutex};
@@ -738,6 +827,105 @@ struct Bot
         curl_slist_free_all(list);
     }
 
+    void build_followers_list()
+    {
+        std::scoped_lock g {curl_mutex};
+        curl_easy_reset(curl_handle);
+        auto list {set_curl_headers(("Authorization: Bearer " + AUTH_TOKEN).c_str(),
+                                ("Client-Id: " + CLIENT_ID).c_str())};
+        
+        String url {"https://api.twitch.tv/helix/channels/followers?broadcaster_id=" + BROADCASTER_ID + "&first=100"};
+        auto s {curl_call(url, curl_handle, list)};
+        users.reserve(5000);
+
+        users.push_back({BROADCASTER_ID});
+
+        while(true)
+        {
+            auto i {s.find("user_id")};
+            if(i != String::npos)
+            {
+                users.push_back({});
+                auto& u {users.back()};
+                u.user_id = json_get_value_naive("user_id", s);
+                u.user_login = json_get_value_naive("user_login", s);
+                s.erase(0, s.find("}", i) + 1);
+                if(s.empty()){
+                    break;
+                }
+            }
+            else
+            {
+                auto cursor {json_get_value_naive("cursor", s)};
+                if(!cursor.empty()){
+                    s = curl_call(url + "&after=" + cursor, curl_handle, list);
+                }
+                else{
+                    break;
+                }
+            }
+        }
+        curl_slist_free_all(list);
+
+        if(users.empty()){
+            return;
+        }
+
+        const auto file {"followers.txt"};
+
+        Vector<User> temp_users;
+
+        String line;
+        String tag;
+        String value;
+        {
+            {
+                std::ifstream o {file};
+                User* current {nullptr};
+                while(std::getline(o, line))
+                {
+                    clean_line(&line);
+                    if(line != "End")
+                    {
+                        if(!line.empty())
+                        {
+                            extract_tag_and_value_from_line(line, &tag, &value);
+                            if(tag == "User")
+                            {
+                                temp_users.push_back({});
+                                current = &temp_users.back();
+                                current->user_id = value;
+                            }
+                            else if(tag == "Points"){
+                                current->points = string_to_int(value);
+                            }
+                            else if(tag == "Gamba_Points"){
+                                current->gamba_points = string_to_int(value);
+                            }
+                            else if(tag == "Social_Credit"){
+                                current->social_credit = string_to_int(value);
+                            }
+                        }
+                    }
+                }
+            }
+            std::ofstream f {file};
+            for(auto& u : users)
+            {
+                User* data {nullptr};
+                for(auto& j : temp_users)
+                {
+                    if(u.user_id == j.user_id)
+                    {
+                        u = j;
+                        break;
+                    }
+                }
+                u.serialize_out(&f);
+            }
+        }
+    }
+    
     void serialize_in()
     {
         String line;
@@ -751,7 +939,8 @@ struct Bot
                 if(!line.empty())
                 {
                     extract_tag_and_value_from_line(line, &tag, &value);
-                    if(tag == "batchest_count"){
+                    if(tag == "BatChest_Count")
+                    {
                         std::stringstream ss {value};
                         ss>>batchest_count;
                     }
@@ -842,13 +1031,31 @@ struct Bot
     
     }
 
-    void quit()
+    void save_data()
     {
+        std::scoped_lock g {generic_mutex};
         {
-            std::ofstream file {data_file_name};
-            //file<<"batchest_count : "<<batchest_count;
+            std::ofstream file {already_followed};
+            for(auto& u : already_thanks_for_the_follow){
+                file<<u<<"\n";
+            }
         }
 
+        {
+            std::ofstream file {"followers.txt"};
+            for(auto& u : users){
+                u.serialize_out(&file);
+            }
+        }
+
+        {
+            std::ofstream file {data_file_name};
+            file<<"BatChest_Count : "<<batchest_count<<"\n\n";
+        }
+    }
+
+    void quit()
+    {
         for(auto& s : sounds)
         {
             if(s.chunk){
@@ -901,7 +1108,7 @@ struct Bot
     Music_Info last_song;
     Vector<Music_Info> music_queue;
     Vector<Pair<String, int>> banned_words;
-    Vector<User> current_users;
+    Vector<User> users;
 
     Vector<Parsed_Message> priv_messages;
     Vector<String> ping_messages;
@@ -909,13 +1116,126 @@ struct Bot
     String already_followed {"already_followed.txt"};
     String data_file_name   {"bot.txt"};
 
+    std::mutex generic_mutex;
     std::mutex sound_mutex;
     std::mutex music_mutex;
     std::mutex send_mutex;
     std::mutex curl_mutex;
+
 };
 
-void commands_callback(Bot* b, const Vector<String>& args)
+void hug_callback(Bot* b, const String& id, const Vector<String>& args)
+{
+    if(args.size() == 1){
+        b->add_message(format_reply(args[0], "hug deez nuts GOTTEM"));
+    }
+    else
+    {
+        if(roll_dice(50)){
+            b->add_message(format_send("@" + args[0] + " is hugging @" + args[1] + " HUGGIES"));
+        }
+        else{
+            b->add_message(format_reply(args[0], "hug deez nuts GOTTEM"));
+        }
+    }
+}
+
+void vanish_callback(Bot* b, const String& id, const Vector<String>& args)
+{
+    if(args.size() == 1){
+        b->ban_user(id, -1);
+    }
+    else{
+        b->ban_user(id, string_to_int(args[1]));
+    }
+}
+
+void bully_callback(Bot* bot, const String& id, const Vector<String>& args)
+{
+    // TODO make this better add slap sound or something
+    if(args.size() == 1 ){
+        bot->add_message(format_reply(args[0], "slap deez nuts GOTTEM"));
+        return;
+    }
+    std::scoped_lock g {bot->generic_mutex};
+    auto a {bot->get_user(id)};
+    auto b {bot->get_user_by_nick(args[1])};
+    if(a && b)
+    {
+        if(a->stronger(*b)){
+            bot->add_message(format_send("@" + args[0] + " slapped " + "@" + args[1]));
+        }
+        else{
+            bot->add_message(format_send("@" + args[1] + " slapped " + "@" + args[0]));
+        }
+    }
+    else{
+        return;
+    }
+}
+
+void gamba_callback(Bot* b, const String& id, const Vector<String>& args)
+{
+    std::scoped_lock g {b->generic_mutex};
+    auto u {b->get_user(id)};
+    if(u)
+    {
+        if(args.size() == 1){
+            b->add_message(format_reply(args[0], "you have " + std::to_string(u->gamba_points) + " points"));
+        }
+        else
+        {
+            s64 points;
+            auto reward_factor {1};
+            if(args[1] == "all")
+            {
+                points = u->gamba_points;
+                reward_factor = 10;
+            }
+            else if(args[1] == "half")
+            {
+                points = u->gamba_points / 2;
+                reward_factor = 5;
+            }
+            else{
+                points = string_to_int<s64>(args[1]);
+            }
+
+            if(points > 0)
+            {
+                if(u->gamba_points < points){
+                    b->add_message(format_reply(args[0], "not enough points"));
+                }
+                else
+                {
+                    auto string_points {std::to_string(points)};
+                    b->add_message(format_reply(args[0], "rolling dice nuts in your mouth GAMBA points at risk is " + string_points));
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+
+                    if(roll_dice(50))
+                    {
+                        u->gamba_points += points * reward_factor;
+                        b->add_message(format_reply(args[0], "you won " + std::to_string(points * reward_factor) + " GAMBA you have " + std::to_string(u->gamba_points) + " points!"));
+                    }
+                    else
+                    {
+                        u->gamba_points -= points;
+                        b->add_message(format_reply(args[0], "you lost " + string_points + " pepeLost noob you have " + std::to_string(u->gamba_points) + " points!"));
+                    }
+                }
+            }
+        }
+
+        if(u->gamba_points <= 0)
+        {
+            u->gamba_points = 500;
+            b->add_message(format_reply(args[0], "noob since you're so poor the gods have blessed you with 500 points GAMBAADDICT"));
+        }
+
+    }
+}
+
+void commands_callback(Bot* b, const String& id, const Vector<String>& args)
 {
     String list;
     for(auto& c : b->commands){
@@ -924,67 +1244,67 @@ void commands_callback(Bot* b, const Vector<String>& args)
     b->add_message(format_reply(args[0], list));
 }
 
-void stack_callback(Bot* b, const Vector<String>& args)
+void stack_callback(Bot* b, const String& id, const Vector<String>& args)
 {
    b->add_message(format_reply(args[0], "stack deez nuts in your mouth GOTTEM"));
 }
 
-void drop_callback(Bot* b, const Vector<String>& args)
+void drop_callback(Bot* b, const String& id, const Vector<String>& args)
 {
    b->add_message(format_reply(args[0], "drop deez nuts in your mouth GOTTEM"));
 }
 
-void discord_callback(Bot* b, const Vector<String>& args)
+void discord_callback(Bot* b, const String& id, const Vector<String>& args)
 {
    b->add_message(format_reply(args[0], "join my discord https://discord.gg/9xVKDekJtg"));
 }
 
-void game_callback(Bot* b, const Vector<String>& args)
+void game_callback(Bot* b, const String& id, const Vector<String>& args)
 {
    b->add_message(format_reply(args[0], "Steam : working on a roguelike called Morphus! https://store.steampowered.com/app/2371310/Morphus/"));
 }
 
-void demo_callback(Bot* b, const Vector<String>& args)
+void demo_callback(Bot* b, const String& id, const Vector<String>& args)
 {
    b->add_message(format_reply(args[0], "Demo : Check out the demo here! https://store.steampowered.com/app/2371310/Morphus/"));
 }
 
-void editor_callback(Bot* b, const Vector<String>& args)
+void editor_callback(Bot* b, const String& id, const Vector<String>& args)
 {
    b->add_message(format_reply(args[0], "Editor : neovim baseg"));
 }
 
-void font_callback(Bot* b, const Vector<String>& args)
+void font_callback(Bot* b, const String& id, const Vector<String>& args)
 {
    b->add_message(format_reply(args[0], "Font : https://github.com/nathco/Office-Code-Pro"));
 }
 
-void keyboard_callback(Bot* b, const Vector<String>& args)
+void keyboard_callback(Bot* b, const String& id, const Vector<String>& args)
 {
    b->add_message(format_reply(args[0], "Keyboard : keychron k8 + kailh white switches"));
 }
 
-void engine_callback(Bot* b, const Vector<String>& args)
+void engine_callback(Bot* b, const String& id, const Vector<String>& args)
 {
    b->add_message(format_reply(args[0], "Engine : c++ and SDL2"));
 }
 
-void vimconfig_callback(Bot* b, const Vector<String>& args)
+void vimconfig_callback(Bot* b, const String& id, const Vector<String>& args)
 {
    b->add_message(format_reply(args[0], "Vim Config : https://github.com/mrnoob17/my-nvim-init/blob/main/init.lua"));
 }
 
-void friends_callback(Bot* b, const Vector<String>& args)
+void friends_callback(Bot* b, const String& id, const Vector<String>& args)
 {
    b->add_message(format_reply(args[0], "Friends : twitch.tv/azenris twitch.tv/tk_dev twitch.tv/tkap1 twitch.tv/athano twitch.tv/cakez77 twitch.tv/tapir2342"));
 }
 
-void os_callback(Bot* b, const Vector<String>& args)
+void os_callback(Bot* b, const String& id, const Vector<String>& args)
 {
    b->add_message(format_reply(args[0], "OS : not linux baseg"));
 }
 
-void tts_callback(Bot* b, const Vector<String>& args)
+void tts_callback(Bot* b, const String& id, const Vector<String>& args)
 {
     // TODO parser needs some work still
     std::scoped_lock g {b->sound_mutex};
@@ -1165,13 +1485,17 @@ void tts_callback(Bot* b, const Vector<String>& args)
     }
 }
 
-void music_callback(Bot* b, const Vector<String>& args)
+void music_callback(Bot* b, const String& id, const Vector<String>& args)
 {
     auto video_link {args[1]};
     std::scoped_lock guard {b->curl_mutex};
 
     {
         auto list {video_link.find("&list")};
+        if(list != String::npos){
+            video_link.erase(list, String::npos);
+        }
+        list = video_link.find("&ab_channel");
         if(list != String::npos){
             video_link.erase(list, String::npos);
         }
@@ -1222,7 +1546,7 @@ void music_callback(Bot* b, const Vector<String>& args)
     b->music_queue.push_back({yt_video, video_link, args});
 }
 
-void skip_song_callback(Bot* b, const Vector<String>& args)
+void skip_song_callback(Bot* b, const String& id, const Vector<String>& args)
 {
     if(!b->music_playing()){
         b->add_message(format_reply(args[0], "Aware no music is playing"));
@@ -1240,7 +1564,7 @@ void skip_song_callback(Bot* b, const Vector<String>& args)
     }
 }
 
-void skip_sound_callback(Bot* b, const Vector<String>& args)
+void skip_sound_callback(Bot* b, const String& id, const Vector<String>& args)
 {
     std::scoped_lock g {b->sound_mutex};
     if(!b->sounds_to_play.empty())
@@ -1257,37 +1581,37 @@ void skip_sound_callback(Bot* b, const Vector<String>& args)
     }
 }
 
-void music_count_callback(Bot* b, const Vector<String>& args)
+void music_count_callback(Bot* b, const String& id, const Vector<String>& args)
 {
     std::scoped_lock g {b->music_mutex};
     b->add_message(format_reply(args[0], std::to_string(b->music_queue.size()) + " song(s) in the queue"));
 }
 
-void song_callback(Bot* b, const Vector<String>& args)
+void song_callback(Bot* b, const String& id, const Vector<String>& args)
 {
     if(b->music_playing()){
         b->add_message(format_reply(args[0], "Song : " + b->last_song.video.title));
     }
 }
 
-void bot_callback(Bot* b, const Vector<String>& args)
+void bot_callback(Bot* b, const String& id, const Vector<String>& args)
 {
     b->add_message(format_reply(args[0], "C++ Twitch Bot : https://github.com/mrnoob17/twitch_bot"));
 }
 
-void batchest_callback(Bot* b, const Vector<String>& args)
+void batchest_callback(Bot* b, const String& id, const Vector<String>& args)
 {
     b->add_message(format_reply(args[0], "BatChest Count : " + std::to_string(b->batchest_count)));
 }
 
-void today_callback(Bot* b, const Vector<String>& args)
+void today_callback(Bot* b, const String& id, const Vector<String>& args)
 {
     if(!b->today.empty()){
         b->add_message(format_reply(args[0], "Today : " + b->today));
     }
 }
 
-void set_today_callback(Bot* b, const Vector<String>& args)
+void set_today_callback(Bot* b, const String& id, const Vector<String>& args)
 {
     b->today = "";
     for(int i = 1; i < args.size(); i++){
@@ -1295,7 +1619,7 @@ void set_today_callback(Bot* b, const Vector<String>& args)
     }
 }
 
-void set_title_callback(Bot* b, const Vector<String>& args)
+void set_title_callback(Bot* b, const String& id, const Vector<String>& args)
 {
     std::scoped_lock guard {b->curl_mutex};
     curl_easy_reset(curl_handle);
@@ -1324,22 +1648,22 @@ void set_title_callback(Bot* b, const Vector<String>& args)
     b->add_message(format_send("Stream Title : " + title));
 }
 
-void founder_callback(Bot* b, const Vector<String>& args)
+void founder_callback(Bot* b, const String& id, const Vector<String>& args)
 {
     b->add_message(format_reply(args[0], "You're a founder... founder of deez nuts! GOTTEM"));
 }
 
-void mod_callback(Bot* b, const Vector<String>& args)
+void mod_callback(Bot* b, const String& id, const Vector<String>& args)
 {
     b->add_message(format_reply(args[0], "You're a moderator, protector of deez nuts GOTTEM"));
 }
 
-void pleb_callback(Bot* b, const Vector<String>& args)
+void pleb_callback(Bot* b, const String& id, const Vector<String>& args)
 {
     b->add_message(format_reply(args[0], "You're a pleb, cultivator of deez nuts GOTTEM"));
 }
 
-void sub_callback(Bot* b, const Vector<String>& args)
+void sub_callback(Bot* b, const String& id, const Vector<String>& args)
 {
     b->add_message(format_reply(args[0], "You're a subscriber, nourisher of deez nuts GOTTEM"));
 }
@@ -1431,6 +1755,10 @@ void start_bot(Bot* _bot, int args, const char** argc)
     bot.add_command("keyboard", keyboard_callback); 
     bot.add_command("vimconfig", vimconfig_callback); 
     bot.add_command("friends", friends_callback); 
+    bot.add_command("gamba", gamba_callback); 
+    bot.add_command("slap", bully_callback); 
+    bot.add_command("vanish", vanish_callback); 
+    bot.add_command("hug", hug_callback); 
     bot.add_command("os", os_callback); 
     bot.add_command("tts", tts_callback); 
     bot.add_command("sr", music_callback); 
@@ -1474,6 +1802,11 @@ void start_bot(Bot* _bot, int args, const char** argc)
 
         bot.event_sub_handle = bot.end_point.get_metadata(bot.event_sub_connection_id);
 
+        bot.build_followers_list();
+
+        std::random_device random_device;
+
+        GENERATOR = std::knuth_b {random_device()};
         auto running {true};
         std::atomic<bool> said_welcome_message {false};
 
@@ -1519,6 +1852,8 @@ void start_bot(Bot* _bot, int args, const char** argc)
         }, &bot)};
         sound_thread.detach();
 
+        Timer bot_save_data_timer;
+        bot_save_data_timer.start(1.f / 30.f);
 
         while(running)
         {
@@ -1529,6 +1864,11 @@ void start_bot(Bot* _bot, int args, const char** argc)
                     bot.add_message("PRIVMSG #" + BROADCASTER_NAME + " :coffee481Happy BatChest coffee481Happy\r\n");
                     said_welcome_message = true;
                 }
+            }
+            if(bot_save_data_timer.is_time())
+            {
+                bot.save_data();
+                bot_save_data_timer.start(1.f / 30.f);
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(sleep_time));
         }
@@ -1544,11 +1884,17 @@ int main(int args, const char** argc)
         return 0;
     }
 
+    // TODO improve vanish and gamba command
+
     // TODO
-    // obs websocket api
-    // cheer notif
-    // point system
+    // periodic messages
+    // sounds
+    // voices
+    // give points
     // social credit system
+    // obs websocket api
+    // point system
+    // cheer notif
     // raid notif
 
     Bot bot;

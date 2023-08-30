@@ -109,8 +109,9 @@ struct Websocket_Endpoint
         return ctx;
     }
 
-    Websocket_Endpoint () : next_id(0)
+    Websocket_Endpoint ()
     {
+        next_id = 0;
         end_point.clear_access_channels(websocketpp::log::alevel::all);
         end_point.clear_error_channels(websocketpp::log::elevel::all);
 

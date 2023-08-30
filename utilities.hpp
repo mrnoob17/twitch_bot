@@ -139,6 +139,15 @@ inline int string_to_int(const String& s)
     return res;
 }
 
+template<typename T>
+inline T string_to_int(const String& s)
+{
+    std::stringstream ss {s};
+    T res;
+    ss>>res;
+    return res;
+}
+
 inline float string_to_float(const String& s)
 {
     std::stringstream ss {s};
