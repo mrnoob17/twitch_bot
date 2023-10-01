@@ -1727,6 +1727,7 @@ void start_bot(Bot* _bot, int args, const char** argc)
                   {"us", Bot::Voice::TikTok, "en_us_001"},
                   {"mus", Bot::Voice::TikTok, "en_us_006"},
                   {"fr", Bot::Voice::TikTok, "fr_001"},
+                  {"fr2", Bot::Voice::TikTok, "fr_002"},
                   {"sing", Bot::Voice::TikTok, "en_female_f08_salut_damour"},
                   {"sing2", Bot::Voice::TikTok, "en_male_m03_lobby"},
                   {"sing3", Bot::Voice::TikTok, "en_female_f08_warmy_breeze"},
