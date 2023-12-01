@@ -34,6 +34,7 @@ String BROADCASTER_ID    {};
 String AUTH_TOKEN        {};
 String YOUTUBE_API_KEY   {};
 String BROADCASTER_NAME  {};
+String BOT_NAME          {};
 String TIKTOK_SESSION_ID {};
 
 struct Parsed_Message
@@ -71,8 +72,17 @@ String tts_text_format(const String& data)
 {
     auto vec {tokenize(data)};
     String result;
-    for(auto& s : vec){
-        result += s + '+';
+    
+    for(auto& s : vec)
+    {
+        for(auto c : s)
+        {
+            if(c == '"' || c == '\''){
+                continue;
+            }
+            result += c;
+        }
+        result += '+';
     }
     result.pop_back();
     return result;
@@ -202,20 +212,48 @@ struct User
 
     bool stronger(const User& b)
     {
-        if(!last_known_badges.empty() && b.last_known_badges.empty()){
+        const bool a_has_bc  {last_known_badges.find(broadcaster_badge) != String::npos};
+        const bool a_has_mod {last_known_badges.find(moderator_badge) != String::npos};
+        const bool a_has_vip {last_known_badges.find(vip_badge) != String::npos};
+        const bool a_has_sub {last_known_badges.find(subscriber_badge) != String::npos};
+
+        const bool b_has_bc  {b.last_known_badges.find(broadcaster_badge) != String::npos};
+        const bool b_has_mod {b.last_known_badges.find(moderator_badge) != String::npos};
+        const bool b_has_vip {b.last_known_badges.find(vip_badge) != String::npos};
+        const bool b_has_sub {b.last_known_badges.find(subscriber_badge) != String::npos};
+
+        if(a_has_bc){
             return true;
         }
-        if(last_known_badges.find(broadcaster_badge) != String::npos){
+        if(b_has_bc){
+            return false;
+        }
+        if(a_has_mod)
+        {
+            if(b_has_mod){
+                return roll_dice(50);
+            }
             return true;
         }
-        if(last_known_badges.find(moderator_badge) != String::npos && b.last_known_badges.find(moderator_badge) == String::npos){
-            return true;
+        if(a_has_vip)
+        {
+            if(b_has_mod){
+                return false;
+            }
+            return roll_dice(75);
         }
-        if(last_known_badges.find(vip_badge) != String::npos && b.last_known_badges.find(vip_badge) == String::npos){
-            return true;
-        }
-        if(last_known_badges.find(subscriber_badge) != String::npos && b.last_known_badges.find(subscriber_badge) == String::npos){
-            return true;
+        if(a_has_sub)
+        {
+            if(b_has_mod){
+                return false;
+            }
+            if(b_has_vip){
+                return roll_dice(25);
+            }
+            if(b_has_sub){
+                return roll_dice(50);
+            }
+            return roll_dice(75);
         }
         return false;
     }
@@ -264,7 +302,7 @@ struct Bot
         Sound* sound {nullptr};
         Mix_Chunk* tts {nullptr};
         int loops {0};
-        int volume {MIX_MAX_VOLUME / 4};
+        int volume {MIX_MAX_VOLUME / 2};
         s64 tts_id {-1};
 
         void play()
@@ -301,6 +339,8 @@ struct Bot
         Callback callback;
         Vector<String> badges;
         bool no_badges;
+        bool enabled   {true};
+        bool togglable {true};
     };
 
     void add_command(const String& name, Callback c, const Vector<String>& badges = {}, const bool no_badges = false)
@@ -396,8 +436,8 @@ struct Bot
                             }
                             if(!found)
                             {
-                                add_message(format_reply_2("Yo lil bro! Thanks for the follow!", s));
-                                message = tts_text_format(s + " thanks for the follow lil bro!");
+                                add_message(format_reply_2("Yo lilbro thanks for the follow!", s));
+                                message = tts_text_format(s + " thanks for the follow lil bro");
 
                                 already_thanks_for_the_follow.push_back(user_id);
                                 users.push_back({user_id});
@@ -406,7 +446,7 @@ struct Bot
                         else if(s == "channel.subscribe" || s == "channel.subscription.message")
                         {
                             s = json_get_value_naive("user_name", data);
-                            add_message(format_reply_2("Yo lil bro! Thanks for subbing!", s));
+                            add_message(format_reply_2("Yo lilbro thanks for subbing!", s));
                             message = tts_text_format(s + " thanks for the subbing lil bro!");
                         }
                         if(!message.empty())
@@ -471,7 +511,7 @@ struct Bot
             if(tokens[0][0] == '!')
             {
                 auto c {find_command(tokens[0].substr(1, String::npos))};
-                if(c)
+                if(c && c->enabled)
                 {
                     has_command = true;
                     bool badge_is_good {};
@@ -528,7 +568,7 @@ struct Bot
                         pos = str.find(p.first, start);
                     }
                 }
-                if(has_banned_word){
+                if(has_banned_word && to_who.empty()){
                     ban_user(msg.user_id, duration);
                 }
             }
@@ -548,6 +588,18 @@ struct Bot
             printf("%s\n", pong.c_str());
             ping_messages.erase(ping_messages.begin());
         }
+        if(!periodic_messages.empty())
+        {
+            if(!periodic_timer.started || periodic_timer.is_time())
+            {
+                add_message(format_send(periodic_messages[current_periodic]));
+                current_periodic++;
+                if(current_periodic >= periodic_messages.size()){
+                    current_periodic = 0;
+                }
+                periodic_timer.start(60 * 15);
+            }
+        }
     }
 
     void check_music_queue()
@@ -560,11 +612,27 @@ struct Bot
             {
                 const auto& music {music_queue.front()};
     
-                String str {"start /min mpv " + music.video_link + " --no-video"};
+                if(current_music){
+                    Mix_FreeMusic(current_music);
+                }
+
+                String str {"yt-dlp " + music.video_link + " --extract-audio --audio-format mp3 --force-overwrites --output \"requested_music.%(ext)s\""};
     
                 auto result {system(str.c_str())};
                 if(result == 0)
                 {
+                    current_music = Mix_LoadMUS("requested_music.mp3");
+
+                    const auto mv {0.08f};
+
+                    if(music.args.size() >= 3){
+                        Mix_VolumeMusic((float)MIX_MAX_VOLUME * mv * string_to_float(music.args[2]));
+                    }
+                    else{
+                        Mix_VolumeMusic((float)MIX_MAX_VOLUME * mv);
+                    }
+
+                    Mix_PlayMusic(current_music, 0);
                     add_message(format_reply_2("Song : " + music.video.title + " requested ->", music.args[0]));
                     last_song = music;
                     last_music_stamp = Clock::now();
@@ -644,19 +712,27 @@ struct Bot
 
     Sound_To_Play get_tts(const Voice* voice, const String& phrase)
     {
-        if(!voice){
-            return tts_from_streamelements("brian", phrase);
-        }
-        else
-        {
-            if(voice->api == Voice::Stream_Elements){
-                return tts_from_streamelements(voice->name, phrase);
-            }
-            else{
-                return tts_from_tiktok(voice->code, phrase);
-            }
-        }
+        auto s {phrase};
+
+        return tts_from_nice_gg(s);
     }
+
+    Sound_To_Play tts_from_nice_gg(const String& phrase)
+    {
+        std::scoped_lock gg {curl_mutex};
+        curl_easy_reset(curl_handle);
+        Sound_To_Play play;
+        String url {"https://nice.gg/tts?msg=" + phrase + "&tiktok_session_id=" + TIKTOK_SESSION_ID};
+        const String data {curl_call(url, curl_handle)};
+
+        auto rwops {SDL_RWFromConstMem((void*)data.data(), data.length())};
+        if(rwops)
+        {
+            play.tts = Mix_LoadWAV_RW(rwops, 0);
+            SDL_RWclose(rwops);
+        }
+        return play;
+    };
 
     Sound_To_Play tts_from_streamelements(String voice, const String& phrase)
     {
@@ -931,6 +1007,7 @@ struct Bot
         String line;
         String tag;
         String value;
+
         {
             std::ifstream file {data_file_name};
             while(std::getline(file, line))
@@ -944,8 +1021,18 @@ struct Bot
                         std::stringstream ss {value};
                         ss>>batchest_count;
                     }
+                    else if(tag == "Gottem_Count")
+                    {
+                        std::stringstream ss {value};
+                        ss>>gottem_count;
+                    }
                 }
             }
+        }
+
+        {
+            std::ifstream file {"video.txt"};
+            file>>video;
         }
 
         {
@@ -1028,6 +1115,17 @@ struct Bot
             }
             printf("finished loading sounds\n");
         }
+
+        {
+            std::ifstream file {"periodic_messages.txt"};
+            while(std::getline(file, line))
+            {
+                clean_line(&line);
+                if(!line.empty()){
+                    periodic_messages.push_back(line);
+                }
+            }
+        }
     
     }
 
@@ -1051,6 +1149,14 @@ struct Bot
         {
             std::ofstream file {data_file_name};
             file<<"BatChest_Count : "<<batchest_count<<"\n\n";
+            file<<"Gottem_Count : "<<gottem_count<<"\n\n";
+        }
+        {
+            if(!video.empty())
+            {
+                std::ofstream file {"video.txt"};
+                file<<video;
+            }
         }
     }
 
@@ -1080,9 +1186,12 @@ struct Bot
     Vector<String> messages_to_send;
 
     u64 batchest_count {0};
-    String today;
-    String event_sub_session_id;
+    u64 gottem_count   {0};
 
+    String today;
+    String video;
+
+    String event_sub_session_id;
 
     struct Voice
     {
@@ -1105,6 +1214,7 @@ struct Bot
 
     Vector<Sound_Effect> sound_effects;
 
+    //std::string music_file;
     Music_Info last_song;
     Vector<Music_Info> music_queue;
     Vector<Pair<String, int>> banned_words;
@@ -1112,6 +1222,11 @@ struct Bot
 
     Vector<Parsed_Message> priv_messages;
     Vector<String> ping_messages;
+
+    Vector<String> periodic_messages;
+
+    Timer periodic_timer {};
+    int current_periodic {0};
 
     String already_followed {"already_followed.txt"};
     String data_file_name   {"bot.txt"};
@@ -1122,6 +1237,7 @@ struct Bot
     std::mutex send_mutex;
     std::mutex curl_mutex;
 
+    Mix_Music* current_music {nullptr};
 };
 
 void hug_callback(Bot* b, const String& id, const Vector<String>& args)
@@ -1131,7 +1247,7 @@ void hug_callback(Bot* b, const String& id, const Vector<String>& args)
     }
     else
     {
-        if(roll_dice(50)){
+        if(roll_dice(75)){
             b->add_message(format_send("@" + args[0] + " is hugging @" + args[1] + " HUGGIES"));
         }
         else{
@@ -1162,15 +1278,57 @@ void bully_callback(Bot* bot, const String& id, const Vector<String>& args)
     auto b {bot->get_user_by_nick(args[1])};
     if(a && b)
     {
+        if(a->last_known_badges.empty() && b->last_known_badges.empty()){
+            return;
+        }
+
         if(a->stronger(*b)){
             bot->add_message(format_send("@" + args[0] + " slapped " + "@" + args[1]));
         }
         else{
             bot->add_message(format_send("@" + args[1] + " slapped " + "@" + args[0]));
         }
+
+        std::scoped_lock gg {bot->sound_mutex};
+        Bot::Sound_To_Play s;
+        s.sound = bot->get_sound("spank");
+        s.play();
+        bot->tts_sounds_to_play_elevated.push_back(s);
     }
     else{
         return;
+    }
+}
+
+void gamba_give_callback(Bot* b, const String& id, const Vector<String>& args)
+{
+    if(args.size() < 3){
+        b->add_message(format_reply(args[0], "need to pass amound and target"));
+    }
+    else
+    {
+        std::scoped_lock g {b->generic_mutex};
+        auto u {b->get_user(id)};
+        if(u)
+        {
+            auto q {string_to_int(args[1])};
+            if(q < 0){
+                b->add_message(format_reply(args[0], "invalid value"));
+            }
+            else if(q > u->gamba_points){
+                b->add_message(format_reply(args[0], "you don't have enough points"));
+            }
+            else
+            {
+                auto t {b->get_user_by_nick(args[2])};
+                if(t)
+                {
+                    t->gamba_points += q;
+                    u->gamba_points -= q;
+                    b->add_message(format_reply(args[0], "you gave " + std::to_string(q) + " " + args[2]));
+                }
+            }
+        }
     }
 }
 
@@ -1244,14 +1402,28 @@ void commands_callback(Bot* b, const String& id, const Vector<String>& args)
     b->add_message(format_reply(args[0], list));
 }
 
+void toggle_command_callback(Bot* b, const String& id, const Vector<String>& args)
+{
+    auto c {b->find_command(args[1])};
+    if(c && c->togglable)
+    {
+        printf("DEEZ NUTS\n");
+        c->enabled = !c->enabled;
+    }
+}
+
 void stack_callback(Bot* b, const String& id, const Vector<String>& args)
 {
    b->add_message(format_reply(args[0], "stack deez nuts in your mouth GOTTEM"));
+   std::scoped_lock g {b->generic_mutex};
+   b->gottem_count++;
 }
 
 void drop_callback(Bot* b, const String& id, const Vector<String>& args)
 {
    b->add_message(format_reply(args[0], "drop deez nuts in your mouth GOTTEM"));
+   std::scoped_lock g {b->generic_mutex};
+   b->gottem_count++;
 }
 
 void discord_callback(Bot* b, const String& id, const Vector<String>& args)
@@ -1296,7 +1468,7 @@ void vimconfig_callback(Bot* b, const String& id, const Vector<String>& args)
 
 void friends_callback(Bot* b, const String& id, const Vector<String>& args)
 {
-   b->add_message(format_reply(args[0], "Friends : twitch.tv/azenris twitch.tv/tk_dev twitch.tv/tkap1 twitch.tv/athano twitch.tv/cakez77 twitch.tv/tapir2342"));
+   b->add_message(format_reply(args[0], "Friends : twitch.tv/azenris twitch.tv/tk_dev twitch.tv/tkap1 twitch.tv/athano twitch.tv/cakez77 twitch.tv/tapir2342 twitch.tv/soulfoam twitch.tv/realSuperku twitch.tv/adriandotjs twitch.tv/travisvroman"));
 }
 
 void os_callback(Bot* b, const String& id, const Vector<String>& args)
@@ -1315,171 +1487,21 @@ void tts_callback(Bot* b, const String& id, const Vector<String>& args)
     const auto previous_size {b->sounds_to_play.size()};
     b->TTS_ID_COUNTER++;
 
-    Vector<Bot::Sound_Effect> current_sound_effects;
-    auto last_global_token {0};
-
+    String msg;
     for(int i = 1; i < args.size(); i++)
     {
-        const auto& s {args[i]};
-
-        if(s[0] == '-' || s[0] == '+')
-        {
-            auto pipe {s.find('|')};
-            auto pipe2 {s.find('|', pipe + 1)};
-
-            String stem;
-
-            if(s.length() == 1)
-            {
-                if(s[0] == '-'){
-                    stem = "minus";
-                }
-                else{
-                    stem = "plus";
-                }
-            }
-            else
-            {
-                if(s.substr(0, 2) == "-p")
-                {
-                    if(s.length() > 2)
-                    {
-                        Bot::Sound_To_Play play;
-                        play.pause.wait = string_to_float(s.substr(2, String::npos));
-                        b->sounds_to_play.push_back(play);
-                    }
-                    continue;
-                }
-                else{
-                    stem = s.substr(1, pipe - 1);
-                }
-            }
-
-            auto se {b->get_sound_effect(stem)};
-            if(se)
-            {
-                //if(!global_phrase.empty() && last_token_index < i){
-                //    current_sound_effects.clear();
-                //}
-                //current_sound_effects.push_back(*se);
-                //auto& see {current_sound_effects.back()};
-                //if(stem == "a")
-                //{
-                //    if(pipe != s.length() - 1){
-                //        see.angle = string_to_int(s.substr(pipe + 1, String::npos)); 
-                //    }
-                //}
-                //last_token_index = i;
-            }
-            else
-            {
-                Bot::Sound_To_Play play;
-
-                auto v {b->has_voice(stem)};
-                if(v)
-                {
-                    String phrase {};
-                    int j;
-                    for(j = i + 1; j < args.size(); j++)
-                    {
-                        // TODO if valid sound or voice continue else keep adding to the phrase
-
-                        if(args[j][0] == '-' || args[j][0] == '+')
-                        {
-                            i = j - 1;
-                            break;
-                        }
-                        phrase += args[j];
-                        if(j != args.size() - 1){
-                            phrase += '+';
-                        }
-                    }
-                    if(j == args.size()){
-                        i = j;
-                    }
-                    current_sound_effects.clear();
-                    play = b->get_tts(v, phrase);
-                    if(last_global_token > i){
-                        global_voice = v;
-                    }
-                }
-                else
-                {
-                    auto sound {b->get_sound(stem)};
-                    if(sound){
-                        play.sound = sound;
-                    }
-                    else{
-                        global_phrase += stem + '+';
-                    }
-                }
-                if(play.sound || play.tts)
-                {
-                    // TODO
-                    if(!global_phrase.empty())
-                    {
-                        global_phrase.pop_back();
-                        auto tts {b->get_tts(global_voice, global_phrase)};
-                        if(tts.tts)
-                        {
-                            tts.sound_effects = current_sound_effects;
-                            b->sounds_to_play.push_back(tts);
-                        }
-                        global_phrase.clear();
-                    }
-                    play.sound_effects = current_sound_effects;
-                    if(play.sound){
-                        current_sound_effects.clear();
-                    }
-                    if(pipe != String::npos)
-                    {
-                        float f;
-                        if(pipe2 == String::npos){
-                            f = string_to_float(s.substr(pipe + 1, String::npos));
-                        }
-                        else{
-                            f = string_to_float(s.substr(pipe + 1, pipe2 - pipe));
-                        }
-                        play.volume = (float)play.volume * f;
-                    }
-                    if(pipe2 != String::npos && pipe2 != s.size() - 1)
-                    {
-                        play.loops = string_to_int(s.substr(pipe2 + 1, String::npos));
-                        if(play.loops > 5){
-                            play.loops = 5;
-                        }
-                        else if(play.loops < 0){
-                            play.loops = 0;
-                        }
-                    }
-                    if(s[0] == '-'){
-                        b->sounds_to_play.push_back(play);
-                    }
-                    else
-                    {
-                        play.loops = 0;
-                        play.play();
-                        b->tts_sounds_to_play_elevated.push_back(play);
-                    }
-                }
-            }
-        }
-        else
-        {
-            global_phrase += s + '+';
-            last_global_token = i;
+        msg += args[i];
+        if(i != args.size() - 1){
+            msg += "%20";
         }
     }
-    if(!global_phrase.empty())
-    {
-        global_phrase.pop_back();
-        auto tts {b->get_tts(global_voice, global_phrase)};
-        if(tts.tts)
-        {
-            tts.sound_effects = current_sound_effects;
-            b->sounds_to_play.push_back(tts);
-        }
+
+    auto sound {b->get_tts({}, msg)};
+
+    if(sound.tts){
+        b->sounds_to_play.push_back(sound);
     }
+
     for(int i = previous_size; i < b->sounds_to_play.size(); i++){
         b->sounds_to_play[i].tts_id = tts_id;
     }
@@ -1489,6 +1511,31 @@ void music_callback(Bot* b, const String& id, const Vector<String>& args)
 {
     auto video_link {args[1]};
     std::scoped_lock guard {b->curl_mutex};
+
+    {
+        String s {"app=desktop&v"};
+        auto mobile {video_link.find("m.")};
+        if(mobile != String::npos){
+            video_link.erase(mobile, 2);
+        }
+        mobile = video_link.find(s);
+        if(mobile != String::npos){
+            video_link.erase(mobile, s.length());
+        }
+    }
+
+    if(video_link.find("youtube.com") == String::npos)
+    {
+        String id;
+        for(int i = video_link.size() - 1; i >= 0; i--)
+        {
+            if(video_link[i] == '/'){
+                break; 
+            }
+            id = video_link[i] + id;
+        }
+        video_link = "https://www.youtube.com/watch?v=" + id;
+    }
 
     {
         auto list {video_link.find("&list")};
@@ -1529,16 +1576,16 @@ void music_callback(Bot* b, const String& id, const Vector<String>& args)
         b->add_message(format_reply(args[0], "AwkwardMonkey invalid video"));
         return;
     }
-    else if(yt_video.like_count < 1000)
-    {
-        b->add_message(format_reply(args[0], "Susge video like count must be >= 1000"));
-        return;
-    }
-    else if(yt_video.view_count < 1000)
-    {
-        b->add_message(format_reply(args[0], "Susge video view count must be >= 1000"));
-        return;
-    }
+    //else if(yt_video.like_count < 50)
+    //{
+    //    b->add_message(format_reply(args[0], "Susge video like count must be >= 50"));
+    //    return;
+    //}
+    //else if(yt_video.view_count < 50)
+    //{
+    //    b->add_message(format_reply(args[0], "Susge video view count must be >= 50"));
+    //    return;
+    //}
 
     b->add_message(format_reply(args[0], "FeelsOkayMan song added to the queue"));
     std::scoped_lock g {b->music_mutex};
@@ -1548,6 +1595,7 @@ void music_callback(Bot* b, const String& id, const Vector<String>& args)
 
 void skip_song_callback(Bot* b, const String& id, const Vector<String>& args)
 {
+    std::scoped_lock g {b->music_mutex};
     if(!b->music_playing()){
         b->add_message(format_reply(args[0], "Aware no music is playing"));
     }
@@ -1555,8 +1603,9 @@ void skip_song_callback(Bot* b, const String& id, const Vector<String>& args)
     {
         if(b->last_song.args[0] == args[0])
         {
-            system("taskkill /f /t /IM mpv.exe");
             b->last_song = {};
+            Mix_FreeMusic(b->current_music);
+            b->current_music = nullptr;
         }
         else{
             b->add_message(format_reply(args[0], "Clueless can't skip other people's songs"));
@@ -1604,19 +1653,40 @@ void batchest_callback(Bot* b, const String& id, const Vector<String>& args)
     b->add_message(format_reply(args[0], "BatChest Count : " + std::to_string(b->batchest_count)));
 }
 
+void gottem_callback(Bot* b, const String& id, const Vector<String>& args)
+{
+    b->add_message(format_reply(args[0], "We have gotted : " + std::to_string(b->gottem_count)));
+}
+
 void today_callback(Bot* b, const String& id, const Vector<String>& args)
 {
+    std::scoped_lock g {b->generic_mutex};
     if(!b->today.empty()){
         b->add_message(format_reply(args[0], "Today : " + b->today));
     }
 }
 
+void video_callback(Bot* b, const String& id, const Vector<String>& args)
+{
+    std::scoped_lock g {b->generic_mutex};
+    if(!b->video.empty()){
+        b->add_message(format_reply(args[0], "Video : " + b->video));
+    }
+}
+
 void set_today_callback(Bot* b, const String& id, const Vector<String>& args)
 {
+    std::scoped_lock g {b->generic_mutex};
     b->today = "";
     for(int i = 1; i < args.size(); i++){
         b->today += args[i] + " ";
     }
+}
+
+void set_video_callback(Bot* b, const String& id, const Vector<String>& args)
+{
+    std::scoped_lock g {b->generic_mutex};
+    b->video = args[1];
 }
 
 void set_title_callback(Bot* b, const String& id, const Vector<String>& args)
@@ -1672,6 +1742,8 @@ void start_bot(Bot* _bot, int args, const char** argc)
 {
     BROADCASTER_NAME = argc[1];
 
+    BOT_NAME = argc[2];
+
     auto& bot {*_bot};
     {
         std::ifstream file {"token.nut"};
@@ -1726,6 +1798,7 @@ void start_bot(Bot* _bot, int args, const char** argc)
                   {"mau", Bot::Voice::TikTok, "en_au_002"},
                   {"us", Bot::Voice::TikTok, "en_us_001"},
                   {"mus", Bot::Voice::TikTok, "en_us_006"},
+                  {"old", Bot::Voice::TikTok, "en_male_narration"},
                   {"fr", Bot::Voice::TikTok, "fr_001"},
                   {"fr2", Bot::Voice::TikTok, "fr_002"},
                   {"sing", Bot::Voice::TikTok, "en_female_f08_salut_damour"},
@@ -1745,6 +1818,7 @@ void start_bot(Bot* _bot, int args, const char** argc)
     //}});
 
     bot.add_command("commands", commands_callback); 
+    bot.add_command("toggle_command", toggle_command_callback, {moderator_badge, broadcaster_badge}); 
     bot.add_command("stack", stack_callback); 
     bot.add_command("drop", drop_callback); 
     bot.add_command("discord", discord_callback); 
@@ -1756,6 +1830,7 @@ void start_bot(Bot* _bot, int args, const char** argc)
     bot.add_command("keyboard", keyboard_callback); 
     bot.add_command("vimconfig", vimconfig_callback); 
     bot.add_command("friends", friends_callback); 
+    bot.add_command("gamba_give", gamba_give_callback); 
     bot.add_command("gamba", gamba_callback); 
     bot.add_command("slap", bully_callback); 
     bot.add_command("vanish", vanish_callback); 
@@ -1769,13 +1844,21 @@ void start_bot(Bot* _bot, int args, const char** argc)
     bot.add_command("song", song_callback); 
     bot.add_command("bot", bot_callback); 
     bot.add_command("batchest", batchest_callback); 
+    bot.add_command("gottem", gottem_callback); 
     bot.add_command("today", today_callback); 
+    bot.add_command("video", video_callback); 
     bot.add_command("settoday", set_today_callback, {moderator_badge, broadcaster_badge}); 
+    bot.add_command("setvideo", set_video_callback, {moderator_badge, broadcaster_badge}); 
     bot.add_command("settitle", set_title_callback, {broadcaster_badge, moderator_badge}); 
     bot.add_command("founder", founder_callback, {founder_badge}); 
     bot.add_command("mod", mod_callback, {moderator_badge}); 
     bot.add_command("sub", sub_callback, {subscriber_badge}); 
     bot.add_command("pleb", pleb_callback, {}, true); 
+
+    {
+        auto tc {bot.find_command("toggle_command")};
+        tc->togglable = false;
+    }
 
     bot.connection_id = bot.end_point.connect("wss://irc-ws.chat.twitch.tv:443", "Twitch IRC", twitch_irc_message_handler);
     bot.event_sub_connection_id = bot.end_point.connect("wss://eventsub.wss.twitch.tv/ws", "Event Sub", event_sub_message_handler);
@@ -1798,7 +1881,7 @@ void start_bot(Bot* _bot, int args, const char** argc)
 
         bot.end_point.send(bot.connection_id, "CAP REQ :twitch.tv/membership twitch.tv/tags twitch.tv/commands\r\n");
         bot.end_point.send(bot.connection_id, "PASS oauth:" + AUTH_TOKEN + "\r\n");
-        bot.end_point.send(bot.connection_id, "NICK " + BROADCASTER_NAME + "\r\n");
+        bot.end_point.send(bot.connection_id, "NICK " + BOT_NAME + "\r\n");
         bot.end_point.send(bot.connection_id, "JOIN #" + BROADCASTER_NAME + "\r\n");
 
         bot.event_sub_handle = bot.end_point.get_metadata(bot.event_sub_connection_id);
@@ -1862,7 +1945,7 @@ void start_bot(Bot* _bot, int args, const char** argc)
             {
                 if(bot.handle->joined)
                 {
-                    bot.add_message("PRIVMSG #" + BROADCASTER_NAME + " :coffee481Happy BatChest coffee481Happy\r\n");
+                    bot.add_message("PRIVMSG #" + BROADCASTER_NAME + " :lilbro BatChest lilbro\r\n");
                     said_welcome_message = true;
                 }
             }
@@ -1888,9 +1971,6 @@ int main(int args, const char** argc)
     // TODO improve vanish and gamba command
 
     // TODO
-    // periodic messages
-    // sounds
-    // voices
     // give points
     // social credit system
     // obs websocket api

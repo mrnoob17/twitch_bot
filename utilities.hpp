@@ -38,6 +38,16 @@ struct Timer
     }
 };
 
+inline void string_erase(String* str, const char c)
+{
+    auto f {str->find(c)};
+    while(f != String::npos)
+    {
+        str->erase(f, 1);
+        f = str->find(c);
+    }
+}
+
 inline void clean_line(String* str)
 {
     if(str->empty()){
